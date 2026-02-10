@@ -19,6 +19,7 @@ const SMTP_PASS = process.env.SMTP_PASS;
 const SMTP_FROM = process.env.SMTP_FROM || SMTP_USER;
 const FIREBASE_SERVICE_ACCOUNT_JSON =
   process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+const OTP_TTL_SECONDS = Number(process.env.OTP_TTL_SECONDS || 300);
 
 if (!RZP_KEY_ID || !RZP_KEY_SECRET) {
   console.warn('[WARN] Missing Razorpay keys in .env');
@@ -123,6 +124,92 @@ app.use(express.json());
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true });
+});
+
+app.post('/send_otp.php', async (req, res) => {
+  try {
+    const email = (req.body?.email || '').toString().trim().toLowerCase();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ success: false, message: 'Invalid email' });
+    }
+    if (!mailer) {
+      return res
+        .status(500)
+        .json({ success: false, message: 'SMTP not configured' });
+    }
+
+    const otp = String(Math.floor(Math.random() * 1000000)).padStart(6, '0');
+    const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
+    const expiresAt = Math.floor(Date.now() / 1000) + OTP_TTL_SECONDS;
+    const docId = crypto.createHash('md5').update(email).digest('hex');
+
+    await db.collection('email_otps').doc(docId).set({
+      email,
+      otp_hash: otpHash,
+      expires_at: expiresAt,
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await sendEmail({
+      to: email,
+      subject: 'Your FairAdda OTP',
+      text: `Your OTP is: ${otp}\nThis OTP will expire in 5 minutes.`,
+    });
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    return res
+      .status(500)
+      .json({ success: false, message: 'Email send failed' });
+  }
+});
+
+app.post('/verify_otp.php', async (req, res) => {
+  try {
+    const email = (req.body?.email || '').toString().trim().toLowerCase();
+    const otp = (req.body?.otp || '').toString().trim();
+    if (
+      !email ||
+      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
+      !/^\d{6}$/.test(otp)
+    ) {
+      return res.status(400).json({ success: false, message: 'Invalid input' });
+    }
+
+    const docId = crypto.createHash('md5').update(email).digest('hex');
+    const docRef = db.collection('email_otps').doc(docId);
+    const snap = await docRef.get();
+    if (!snap.exists) {
+      return res
+        .status(401)
+        .json({ success: false, message: 'Invalid or expired OTP' });
+    }
+
+    const data = snap.data() || {};
+    const expiresAt = Number(data.expires_at || 0);
+    if (expiresAt < Math.floor(Date.now() / 1000)) {
+      await docRef.delete();
+      return res
+        .status(401)
+        .json({ success: false, message: 'Invalid or expired OTP' });
+    }
+
+    const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
+    if (otpHash !== data.otp_hash) {
+      return res
+        .status(401)
+        .json({ success: false, message: 'Invalid or expired OTP' });
+    }
+
+    await docRef.delete();
+    return res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    return res
+      .status(401)
+      .json({ success: false, message: 'Invalid or expired OTP' });
+  }
 });
 
 async function authMiddleware(req, res, next) {
