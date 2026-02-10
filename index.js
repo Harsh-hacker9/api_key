@@ -235,7 +235,10 @@ app.post('/razorpay/create-order', authMiddleware, async (req, res) => {
     }
     const amountPaise = Math.round(amount * 100);
 
-    const receipt = `wallet_${req.user.uid}_${Date.now()}`;
+    const receiptSource = `${req.user.uid}_${Date.now()}`;
+    const receipt =
+      'wa_' +
+      crypto.createHash('sha1').update(receiptSource).digest('hex').slice(0, 32);
     const order = await razorpay.orders.create({
       amount: amountPaise,
       currency: 'INR',
