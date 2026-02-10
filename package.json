@@ -1,0 +1,23 @@
+{
+  "name": "fair-adda-razorpay",
+  "version": "1.0.0",
+  "description": "Razorpay backend for Fair Adda wallet deposit/withdraw",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "firebase-admin": "^12.5.0",
+    "morgan": "^1.10.0",
+    "nodemailer": "^6.9.15",
+    "razorpay": "^2.9.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.3"
+  }
+}
