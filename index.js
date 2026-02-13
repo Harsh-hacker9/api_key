@@ -20,6 +20,9 @@ const SMTP_FROM = process.env.SMTP_FROM || SMTP_USER;
 const FIREBASE_SERVICE_ACCOUNT_JSON =
   process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
 const OTP_TTL_SECONDS = Number(process.env.OTP_TTL_SECONDS || 300);
+const APP_NAME = process.env.APP_NAME || 'FairAdda';
+const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || SMTP_USER || '';
+const APP_BASE_URL = process.env.APP_BASE_URL || 'https://fairadda.com';
 
 if (!RZP_KEY_ID || !RZP_KEY_SECRET) {
   console.warn('[WARN] Missing Razorpay keys in .env');
@@ -79,13 +82,83 @@ function normalizeOtp(value) {
   return (value || '').toString().replace(/\D/g, '').slice(0, 6);
 }
 
-async function sendEmail({ to, subject, text }) {
+function escapeHtml(value) {
+  return (value || '')
+    .toString()
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function buildOtpEmailHtml({ otp, ttlMinutes, email }) {
+  const safeOtp = escapeHtml(otp);
+  const safeEmail = escapeHtml(email);
+  const safeAppName = escapeHtml(APP_NAME);
+  const safeSupport = escapeHtml(SUPPORT_EMAIL);
+  const safeBase = escapeHtml(APP_BASE_URL);
+  return `
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>${safeAppName} OTP</title>
+  </head>
+  <body style="margin:0;background:#0f1115;font-family:Arial,sans-serif;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 12px;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px;background:#171a21;border:1px solid #2a3040;border-radius:12px;overflow:hidden;">
+            <tr>
+              <td style="padding:20px 24px;background:#d32f2f;color:#ffffff;font-size:20px;font-weight:700;">
+                ${safeAppName}
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:24px;color:#e8ebf1;">
+                <p style="margin:0 0 12px;font-size:16px;">Verify your login</p>
+                <p style="margin:0 0 16px;color:#bac0cf;font-size:14px;">
+                  Use the OTP below to continue. This code is valid for ${ttlMinutes} minutes.
+                </p>
+                <div style="margin:16px 0;padding:14px 16px;background:#0f1115;border:1px dashed #3b4254;border-radius:8px;text-align:center;">
+                  <span style="font-size:30px;letter-spacing:10px;font-weight:700;color:#ffffff;">${safeOtp}</span>
+                </div>
+                <p style="margin:0 0 16px;color:#98a1b3;font-size:12px;">
+                  Requested for: ${safeEmail}
+                </p>
+                <p style="margin:0 0 16px;color:#98a1b3;font-size:12px;">
+                  If you did not request this OTP, you can ignore this email.
+                </p>
+                <a href="${safeBase}" style="display:inline-block;background:#d32f2f;color:#fff;text-decoration:none;padding:10px 14px;border-radius:6px;font-size:13px;">Open ${safeAppName}</a>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:14px 24px;background:#11141b;color:#7f889a;font-size:12px;">
+                Need help? Contact ${safeSupport}
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>`;
+}
+
+async function sendEmail({ to, subject, text, html }) {
   if (!mailer || !to) return;
   await mailer.sendMail({
     from: SMTP_FROM,
+    replyTo: SUPPORT_EMAIL || undefined,
     to,
     subject,
     text,
+    html,
+    headers: {
+      'X-Auto-Response-Suppress': 'OOF, AutoReply',
+    },
   });
 }
 
@@ -170,10 +243,16 @@ app.post('/send_otp.php', async (req, res) => {
       created_at: admin.firestore.FieldValue.serverTimestamp(),
     });
 
+    const ttlMinutes = Math.max(1, Math.floor(OTP_TTL_SECONDS / 60));
     await sendEmail({
       to: email,
-      subject: 'Your FairAdda OTP',
-      text: `Your OTP is: ${otp}\nThis OTP will expire in 5 minutes.`,
+      subject: `${APP_NAME} verification code`,
+      text:
+        `${APP_NAME} OTP: ${otp}\n` +
+        `Valid for ${ttlMinutes} minutes.\n` +
+        `Requested for: ${email}\n` +
+        `If this was not you, ignore this email.`,
+      html: buildOtpEmailHtml({ otp, ttlMinutes, email }),
     });
 
     return res.json({ success: true });
