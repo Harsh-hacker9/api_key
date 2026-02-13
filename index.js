@@ -71,6 +71,14 @@ const mailer =
       })
     : null;
 
+function normalizeEmail(value) {
+  return (value || '').toString().trim().toLowerCase();
+}
+
+function normalizeOtp(value) {
+  return (value || '').toString().replace(/\D/g, '').slice(0, 6);
+}
+
 async function sendEmail({ to, subject, text }) {
   if (!mailer || !to) return;
   await mailer.sendMail({
@@ -128,7 +136,7 @@ app.get('/health', (_req, res) => {
 
 app.post('/send_otp.php', async (req, res) => {
   try {
-    const email = (req.body?.email || '').toString().trim().toLowerCase();
+    const email = normalizeEmail(req.body?.email);
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return res.status(400).json({ success: false, message: 'Invalid email' });
     }
@@ -138,15 +146,27 @@ app.post('/send_otp.php', async (req, res) => {
         .json({ success: false, message: 'SMTP not configured' });
     }
 
+    const nowSec = Math.floor(Date.now() / 1000);
     const otp = String(Math.floor(Math.random() * 1000000)).padStart(6, '0');
     const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
-    const expiresAt = Math.floor(Date.now() / 1000) + OTP_TTL_SECONDS;
+    const expiresAt = nowSec + OTP_TTL_SECONDS;
     const docId = crypto.createHash('md5').update(email).digest('hex');
+    const docRef = db.collection('email_otps').doc(docId);
+    const existingSnap = await docRef.get();
+    const existing = existingSnap.data() || {};
+    const existingHash = (existing.otp_hash || '').toString();
+    const existingExpiry = Number(existing.expires_at || 0);
+    const shouldKeepPrevious = existingHash.length > 0 && existingExpiry >= nowSec;
 
-    await db.collection('email_otps').doc(docId).set({
+    await docRef.set({
       email,
       otp_hash: otpHash,
       expires_at: expiresAt,
+      otp_prev_hash: shouldKeepPrevious ? existingHash : '',
+      otp_prev_expires_at: shouldKeepPrevious
+          ? Math.min(existingExpiry, expiresAt)
+          : 0,
+      created_at_epoch: nowSec,
       created_at: admin.firestore.FieldValue.serverTimestamp(),
     });
 
@@ -167,8 +187,8 @@ app.post('/send_otp.php', async (req, res) => {
 
 app.post('/verify_otp.php', async (req, res) => {
   try {
-    const email = (req.body?.email || '').toString().trim().toLowerCase();
-    const otp = (req.body?.otp || '').toString().trim();
+    const email = normalizeEmail(req.body?.email);
+    const otp = normalizeOtp(req.body?.otp);
     if (
       !email ||
       !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
@@ -183,23 +203,29 @@ app.post('/verify_otp.php', async (req, res) => {
     if (!snap.exists) {
       return res
         .status(401)
-        .json({ success: false, message: 'Invalid or expired OTP' });
+        .json({ success: false, message: 'OTP not found. Please resend OTP.' });
     }
 
     const data = snap.data() || {};
+    const nowSec = Math.floor(Date.now() / 1000);
     const expiresAt = Number(data.expires_at || 0);
-    if (expiresAt < Math.floor(Date.now() / 1000)) {
+    if (expiresAt < nowSec) {
       await docRef.delete();
       return res
         .status(401)
-        .json({ success: false, message: 'Invalid or expired OTP' });
+        .json({ success: false, message: 'OTP expired. Please resend OTP.' });
     }
 
     const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
-    if (otpHash !== data.otp_hash) {
+    const currentHash = (data.otp_hash || '').toString();
+    const prevHash = (data.otp_prev_hash || '').toString();
+    const prevExpiry = Number(data.otp_prev_expires_at || 0);
+    const currentMatch = otpHash === currentHash;
+    const previousMatch = otpHash === prevHash && prevExpiry >= nowSec;
+    if (!currentMatch && !previousMatch) {
       return res
         .status(401)
-        .json({ success: false, message: 'Invalid or expired OTP' });
+        .json({ success: false, message: 'Incorrect OTP. Please try again.' });
     }
 
     await docRef.delete();
@@ -208,7 +234,7 @@ app.post('/verify_otp.php', async (req, res) => {
     console.error(err);
     return res
       .status(401)
-      .json({ success: false, message: 'Invalid or expired OTP' });
+      .json({ success: false, message: 'OTP verification failed' });
   }
 });
 
