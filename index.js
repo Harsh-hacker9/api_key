@@ -1244,6 +1244,15 @@ app.post('/wallet/withdraw', firebaseAuthMiddleware, async (req, res) => {
     const amount = Number(req.body.amount);
     const method = (req.body.method || 'upi').toString();
     const upiId = (req.body.upiId || '').toString().trim();
+    const accountHolderName = (req.body.accountHolderName || '')
+      .toString()
+      .trim();
+    const bankAccountNumber = (req.body.bankAccountNumber || '')
+      .toString()
+      .trim();
+    const ifsc = (req.body.ifsc || '').toString().trim().toUpperCase();
+    const bankName = (req.body.bankName || '').toString().trim();
+    const branch = (req.body.branch || '').toString().trim();
 
     if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ error: 'Invalid amount' });
@@ -1270,14 +1279,34 @@ app.post('/wallet/withdraw', firebaseAuthMiddleware, async (req, res) => {
         'wallet.total': admin.firestore.FieldValue.increment(-amount),
       });
 
-      tx.set(withdrawRef, {
+      const withdrawPayload = {
         userId: req.user.uid,
         amount,
         method,
         upiId,
         status: 'pending',
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
+      };
+
+      if (accountHolderName) {
+        withdrawPayload.accountHolderName = accountHolderName;
+      }
+      if (method === 'bank') {
+        if (bankAccountNumber) {
+          withdrawPayload.bankAccountNumber = bankAccountNumber;
+        }
+        if (ifsc) {
+          withdrawPayload.ifsc = ifsc;
+        }
+        if (bankName) {
+          withdrawPayload.bankName = bankName;
+        }
+        if (branch) {
+          withdrawPayload.branch = branch;
+        }
+      }
+
+      tx.set(withdrawRef, withdrawPayload);
 
       tx.set(txRef, {
         userId: req.user.uid,
