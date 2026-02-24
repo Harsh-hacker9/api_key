@@ -11,5 +11,15 @@
       "src": "/(.*)",
       "dest": "/index.js"
     }
+  ],
+  "crons": [
+    {
+      "path": "/notifications/push/worker/run",
+      "schedule": "*/5 * * * *"
+    },
+    {
+      "path": "/notifications/campaign/daily/run",
+      "schedule": "30 3 * * *"
+    }
   ]
 }
