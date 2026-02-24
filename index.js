@@ -36,6 +36,17 @@ const API_KEY_DEFAULT_TTL_DAYS = Number(
   process.env.API_KEY_DEFAULT_TTL_DAYS || 365
 );
 const API_KEY_MAX_PER_USER = Number(process.env.API_KEY_MAX_PER_USER || 20);
+const PUSH_WORKER_INTERVAL_MS = Number(
+  process.env.PUSH_WORKER_INTERVAL_MS || 15000
+);
+const PUSH_WORKER_BATCH_SIZE = Math.max(
+  1,
+  Number(process.env.PUSH_WORKER_BATCH_SIZE || 60)
+);
+const CRON_SECRET = (process.env.CRON_SECRET || '').toString().trim();
+const NOTIFICATION_TZ_OFFSET_MINUTES = Number(
+  process.env.NOTIFICATION_TZ_OFFSET_MINUTES || 330
+);
 
 if (!RZP_KEY_ID || !RZP_KEY_SECRET) {
   console.warn('[WARN] Missing Razorpay keys in .env');
@@ -54,6 +65,9 @@ if (!process.env.SESSION_TOKEN_SECRET) {
 }
 if (!process.env.API_KEY_SECRET) {
   console.warn('[WARN] Missing API_KEY_SECRET, using fallback secret');
+}
+if (!process.env.CRON_SECRET) {
+  console.warn('[WARN] Missing CRON_SECRET, cron endpoints will reject requests');
 }
 
 let serviceAccount = null;
@@ -415,10 +429,55 @@ async function getOrCreateAuthUserByEmail(email) {
   }
 }
 
-async function ensureUserProfile(uid, email) {
+async function getAuthUserByEmail(email) {
+  try {
+    return await admin.auth().getUserByEmail(email);
+  } catch (err) {
+    if (err?.code === 'auth/user-not-found') {
+      return null;
+    }
+    throw err;
+  }
+}
+
+async function findUserProfileByEmail(email) {
+  const normalized = normalizeEmail(email);
+  if (!normalized) return null;
+
+  const byLower = await db
+    .collection('users')
+    .where('emailLower', '==', normalized)
+    .limit(1)
+    .get();
+  if (!byLower.empty) {
+    return byLower.docs[0];
+  }
+
+  const byEmail = await db
+    .collection('users')
+    .where('email', '==', normalized)
+    .limit(1)
+    .get();
+  if (!byEmail.empty) {
+    return byEmail.docs[0];
+  }
+
+  return null;
+}
+
+async function ensureUserProfile(uid, email, options = {}) {
+  const createIfMissing = options.createIfMissing !== false;
+  const markRegistered = options.markRegistered === true;
   const ref = db.collection('users').doc(uid);
   await db.runTransaction(async (tx) => {
     const snap = await tx.get(ref);
+    if (!snap.exists && !createIfMissing) {
+      throw buildHttpError(
+        403,
+        'User profile not found. Please register first.',
+        'PROFILE_NOT_FOUND'
+      );
+    }
     const data = snap.data() || {};
     const update = {
       email,
@@ -428,6 +487,9 @@ async function ensureUserProfile(uid, email) {
       lastLoginAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
+    if (markRegistered && !data.registeredAt) {
+      update.registeredAt = admin.firestore.FieldValue.serverTimestamp();
+    }
     if (!data.role) {
       update.role = 'user';
     }
@@ -867,8 +929,30 @@ app.get('/health', (_req, res) => {
 async function sendOtpHandler(req, res) {
   try {
     const email = normalizeEmail(req.body?.email);
+    const modeInput = (req.body?.mode || '').toString().trim().toLowerCase();
+    const mode = modeInput === 'signup' ? 'signup' : modeInput === 'login' ? 'login' : '';
     if (!email || !isValidEmail(email)) {
       return res.status(400).json({ success: false, message: 'Invalid email' });
+    }
+
+    if (mode === 'login') {
+      const userProfile = await findUserProfileByEmail(email);
+      if (!userProfile) {
+        return res.status(404).json({
+          success: false,
+          message: 'Please register first',
+          code: 'USER_NOT_REGISTERED',
+        });
+      }
+    } else if (mode === 'signup') {
+      const userProfile = await findUserProfileByEmail(email);
+      if (userProfile) {
+        return res.status(409).json({
+          success: false,
+          message: 'Email already exists',
+          code: 'EMAIL_ALREADY_EXISTS',
+        });
+      }
     }
 
     await sendOtpToEmail(email);
@@ -897,6 +981,8 @@ async function verifyOtpHandler(req, res, options = {}) {
     const email = normalizeEmail(req.body?.email);
     const otp = normalizeOtp(req.body?.otp);
     const platform = getClientPlatform(req, 'app');
+    const modeInput = (req.body?.mode || '').toString().trim().toLowerCase();
+    const mode = modeInput === 'signup' ? 'signup' : 'login';
     const issueSession = legacyMode
       ? req.body?.issueSession === true
       : req.body?.issueSession !== false;
@@ -917,14 +1003,49 @@ async function verifyOtpHandler(req, res, options = {}) {
       });
     }
 
-    const user = await getOrCreateAuthUserByEmail(email);
-    await ensureUserProfile(user.uid, email);
+    let user;
+    const profileDoc = await findUserProfileByEmail(email);
+    const authUser = await getAuthUserByEmail(email);
+
+    if (mode === 'login') {
+      if (!profileDoc || !authUser) {
+        return res.status(403).json({
+          success: false,
+          message: 'Please register first',
+          code: 'USER_NOT_REGISTERED',
+        });
+      }
+      if (profileDoc.id !== authUser.uid) {
+        return res.status(403).json({
+          success: false,
+          message: 'Account mismatch. Contact support.',
+          code: 'ACCOUNT_UID_MISMATCH',
+        });
+      }
+      user = authUser;
+      await ensureUserProfile(user.uid, email, { createIfMissing: false });
+    } else {
+      if (profileDoc) {
+        return res.status(409).json({
+          success: false,
+          message: 'Email already exists',
+          code: 'EMAIL_ALREADY_EXISTS',
+        });
+      }
+      user = authUser || (await getOrCreateAuthUserByEmail(email));
+      await ensureUserProfile(user.uid, email, {
+        createIfMissing: true,
+        markRegistered: true,
+      });
+    }
+
     const response = {
       success: true,
       message: 'OTP verified',
       uid: user.uid,
       email,
       platform,
+      mode,
     };
 
     if (issueCustomToken) {
@@ -985,6 +1106,117 @@ const firebaseAuthMiddleware = requireAuth({
   allowApiKey: false,
 });
 
+function isStaffRoleValue(role) {
+  const normalized = (role || '').toString().trim().toLowerCase();
+  return (
+    normalized === 'admin' ||
+    normalized === 'owner' ||
+    normalized === 'staff' ||
+    normalized === 'creator'
+  );
+}
+
+function toAmount(value) {
+  if (value == null) return 0;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+  const parsed = Number(
+    value
+      .toString()
+      .replace(/[^0-9.\-]/g, '')
+      .trim()
+  );
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function dateKeyAtOffset(offsetMinutes = NOTIFICATION_TZ_OFFSET_MINUTES) {
+  const offset = Number.isFinite(Number(offsetMinutes))
+    ? Number(offsetMinutes)
+    : NOTIFICATION_TZ_OFFSET_MINUTES;
+  const shifted = new Date(Date.now() + offset * 60 * 1000);
+  return shifted.toISOString().slice(0, 10);
+}
+
+function requireCronAuth(req, res, next) {
+  if (!CRON_SECRET) {
+    return res.status(503).json({ error: 'CRON_SECRET not configured' });
+  }
+  const auth = (req.headers.authorization || '').toString().trim();
+  const token = auth.toLowerCase().startsWith('bearer ')
+    ? auth.slice('bearer '.length).trim()
+    : '';
+  if (token !== CRON_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized cron request' });
+  }
+  return next();
+}
+
+async function enqueueUserInAppAndPush({
+  userId,
+  title,
+  body,
+  type,
+  screen,
+  data = {},
+  inAppDocId = '',
+  pushDocId = '',
+  createdById = 'system',
+  createdByRole = 'system',
+}) {
+  const uid = (userId || '').toString().trim();
+  if (!uid) return false;
+
+  const userNotifs = db.collection('users').doc(uid).collection('notifications');
+  const inAppRef = inAppDocId.trim() ? userNotifs.doc(inAppDocId.trim()) : userNotifs.doc();
+  const pushQueue = db.collection('push_notifications_queue');
+  const pushRef = pushDocId.trim() ? pushQueue.doc(pushDocId.trim()) : pushQueue.doc();
+
+  const payload = {
+    ...data,
+    userId: uid,
+    title: (title || 'Notification').toString().trim() || 'Notification',
+    body: (body || '').toString().trim(),
+    type: (type || 'generic').toString().trim() || 'generic',
+    createdById,
+    createdByRole,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+
+  const batch = db.batch();
+  batch.set(
+    inAppRef,
+    {
+      ...payload,
+      isRead: false,
+    },
+    { merge: true }
+  );
+  batch.set(
+    pushRef,
+    {
+      ...payload,
+      screen: (screen || 'announcement').toString().trim() || 'announcement',
+      status: 'pending',
+    },
+    { merge: true }
+  );
+  await batch.commit();
+  return true;
+}
+
+async function flushPushQueueNow({ maxTicks = 8, batchSize = PUSH_WORKER_BATCH_SIZE } = {}) {
+  let ticks = 0;
+  const summary = { picked: 0, sent: 0, failed: 0 };
+  while (ticks < Math.max(1, Number(maxTicks) || 1)) {
+    const result = await processPendingPushQueue(batchSize);
+    summary.picked += Number(result.picked || 0);
+    summary.sent += Number(result.sent || 0);
+    summary.failed += Number(result.failed || 0);
+    ticks += 1;
+    if (Number(result.picked || 0) <= 0) break;
+  }
+  return summary;
+}
+
 app.get('/auth/me', integrationAuthMiddleware, async (req, res) => {
   try {
     const userSnap = await db.collection('users').doc(req.user.uid).get();
@@ -1008,6 +1240,303 @@ app.get('/auth/me', integrationAuthMiddleware, async (req, res) => {
   } catch (err) {
     console.error(err);
     return res.status(500).json({ success: false, error: 'Failed to fetch profile' });
+  }
+});
+
+app.post('/notifications/push/flush', firebaseAuthMiddleware, async (req, res) => {
+  try {
+    const meSnap = await db.collection('users').doc(req.user.uid).get();
+    const role = (meSnap.data()?.role || '').toString();
+    if (!isStaffRoleValue(role)) {
+      return res.status(403).json({ error: 'Only staff can process push queue' });
+    }
+    const size = Math.max(
+      1,
+      Math.min(200, Number(req.body?.batchSize || PUSH_WORKER_BATCH_SIZE) || PUSH_WORKER_BATCH_SIZE)
+    );
+    const result = await processPendingPushQueue(size);
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Failed to process push queue' });
+  }
+});
+
+app.post('/notifications/scratch-unlock/sync', firebaseAuthMiddleware, async (req, res) => {
+  try {
+    const uid = (req.user?.uid || '').toString().trim();
+    if (!uid) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const leaguesSnap = await db
+      .collection('user_leagues')
+      .where('userId', '==', uid)
+      .get();
+
+    let completedCount = 0;
+    for (const doc of leaguesSnap.docs) {
+      const data = doc.data() || {};
+      const status = (data.resultStatus || data.status || '').toString().trim().toLowerCase();
+      if (status === 'completed') {
+        completedCount += 1;
+      }
+    }
+
+    const earnedCards = Math.floor(completedCount / 5);
+    const userRef = db.collection('users').doc(uid);
+    const txResult = await db.runTransaction(async (tx) => {
+      const userSnap = await tx.get(userRef);
+      const userData = userSnap.data() || {};
+      const scratch = userData.scratch && typeof userData.scratch === 'object' ? userData.scratch : {};
+      const notifiedCount = Math.max(0, Number(scratch.unlockNotifiedCount || 0) || 0);
+
+      if (earnedCards <= notifiedCount) {
+        return {
+          sent: false,
+          earnedCards,
+          notifiedCount,
+          newUnlocks: 0,
+        };
+      }
+
+      const newUnlocks = earnedCards - notifiedCount;
+      const title = newUnlocks > 1 ? `${newUnlocks} Scratch Cards Unlocked` : 'Scratch Card Unlocked';
+      const body =
+        newUnlocks > 1
+          ? `Great news! ${newUnlocks} new scratch cards are now available.`
+          : 'Great news! A new scratch card is now available.';
+      const inAppRef = userRef.collection('notifications').doc(`scratch_unlock_${earnedCards}`);
+      const pushRef = db.collection('push_notifications_queue').doc(`scratch_unlock_${uid}_${earnedCards}`);
+
+      tx.set(
+        inAppRef,
+        {
+          userId: uid,
+          title,
+          body,
+          type: 'scratch_unlocked',
+          screen: 'scratch',
+          isRead: false,
+          unlockCount: newUnlocks,
+          earnedCards,
+          createdById: 'system',
+          createdByRole: 'system',
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+      tx.set(
+        pushRef,
+        {
+          userId: uid,
+          title,
+          body,
+          type: 'scratch_unlocked',
+          screen: 'scratch',
+          status: 'pending',
+          unlockCount: newUnlocks,
+          earnedCards,
+          createdById: 'system',
+          createdByRole: 'system',
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+      tx.set(
+        userRef,
+        {
+          'scratch.unlockNotifiedCount': earnedCards,
+          'scratch.lastUnlockNotifiedAt': admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      return {
+        sent: true,
+        earnedCards,
+        notifiedCount,
+        newUnlocks,
+      };
+    });
+
+    let pushResult = { picked: 0, sent: 0, failed: 0 };
+    if (txResult.sent) {
+      pushResult = await flushPushQueueNow({ maxTicks: 2, batchSize: PUSH_WORKER_BATCH_SIZE });
+    }
+    return res.json({
+      ok: true,
+      ...txResult,
+      push: pushResult,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Failed to sync scratch unlock notifications' });
+  }
+});
+
+async function queueDailyCampaignNotifications({ dateKey }) {
+  const normalizedDateKey = (dateKey || '').toString().trim();
+  if (!normalizedDateKey) throw new Error('Missing date key for daily campaign');
+
+  let scannedUsers = 0;
+  let touchedUsers = 0;
+  let queuedNotifications = 0;
+  let cursor = null;
+
+  for (;;) {
+    let query = db
+      .collection('users')
+      .orderBy(admin.firestore.FieldPath.documentId())
+      .limit(300);
+    if (cursor) query = query.startAfter(cursor);
+    const snap = await query.get();
+    if (snap.empty) break;
+
+    let batch = db.batch();
+    let opCount = 0;
+    const commitBatch = async () => {
+      if (opCount === 0) return;
+      await batch.commit();
+      batch = db.batch();
+      opCount = 0;
+    };
+
+    for (const doc of snap.docs) {
+      scannedUsers += 1;
+      const uid = doc.id;
+      const data = doc.data() || {};
+      const role = (data.role || 'user').toString().trim().toLowerCase();
+      if (isStaffRoleValue(role)) continue;
+      const status = (data.status || 'active').toString().trim().toLowerCase();
+      if (status === 'banned' || data.isBanned === true) continue;
+
+      const wallet = data.wallet && typeof data.wallet === 'object' ? data.wallet : {};
+      const hasDeposit = toAmount(wallet.deposit) > 0;
+      const notificationsMeta =
+        data.notificationsMeta && typeof data.notificationsMeta === 'object'
+          ? data.notificationsMeta
+          : {};
+
+      const alreadySentJoin =
+        (notificationsMeta.dailyJoinPlayDate || '').toString() === normalizedDateKey;
+      const alreadySentReferral =
+        (notificationsMeta.dailyReferralDate || '').toString() === normalizedDateKey;
+      const alreadySentComeback =
+        (notificationsMeta.dailyComebackDate || '').toString() === normalizedDateKey;
+      if (alreadySentJoin && alreadySentReferral && alreadySentComeback) continue;
+
+      const userRef = db.collection('users').doc(uid);
+      const userUpdates = {
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+      let userTouched = false;
+
+      const campaigns = [];
+      if (!alreadySentJoin) {
+        campaigns.push({
+          id: hasDeposit ? 'daily_join_play' : 'daily_deposit_play',
+          title: hasDeposit ? 'Join & Play Today' : 'Deposit & Join & Play Today',
+          body: hasDeposit
+            ? 'Fresh matches are waiting. Join now and win rewards.'
+            : 'Top up wallet, join today matches, and win rewards.',
+          screen: hasDeposit ? 'join_play' : 'wallet',
+          metaKey: 'notificationsMeta.dailyJoinPlayDate',
+        });
+      }
+      if (!alreadySentReferral) {
+        campaigns.push({
+          id: 'daily_referral',
+          title: 'Refer & Earn',
+          body: 'Invite friends to Fair Adda and earn referral rewards.',
+          screen: 'referrals',
+          metaKey: 'notificationsMeta.dailyReferralDate',
+        });
+      }
+      if (!alreadySentComeback) {
+        campaigns.push({
+          id: 'daily_comeback',
+          title: 'Come Back & Win',
+          body: 'Daily tournaments are live. Come back now and play to win.',
+          screen: 'join_play',
+          metaKey: 'notificationsMeta.dailyComebackDate',
+        });
+      }
+
+      for (const campaign of campaigns) {
+        batch.set(
+          db.collection('push_notifications_queue').doc(`${campaign.id}_${uid}_${normalizedDateKey}`),
+          {
+            userId: uid,
+            title: campaign.title,
+            body: campaign.body,
+            type: campaign.id,
+            screen: campaign.screen,
+            status: 'pending',
+            createdById: 'system',
+            createdByRole: 'system',
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+        opCount += 1;
+        queuedNotifications += 1;
+        userUpdates[campaign.metaKey] = normalizedDateKey;
+        userTouched = true;
+      }
+
+      if (userTouched) {
+        batch.set(userRef, userUpdates, { merge: true });
+        opCount += 1;
+        touchedUsers += 1;
+      }
+
+      if (opCount >= 360) await commitBatch();
+    }
+
+    await commitBatch();
+    cursor = snap.docs[snap.docs.length - 1];
+    if (snap.size < 300) break;
+  }
+
+  return {
+    dateKey: normalizedDateKey,
+    scannedUsers,
+    touchedUsers,
+    queuedNotifications,
+  };
+}
+app.get('/notifications/push/worker/run', requireCronAuth, async (req, res) => {
+  try {
+    const batchSize = Math.max(
+      1,
+      Math.min(200, Number(req.query.batchSize || PUSH_WORKER_BATCH_SIZE) || PUSH_WORKER_BATCH_SIZE)
+    );
+    const maxTicks = Math.max(1, Math.min(25, Number(req.query.maxTicks || 4) || 4));
+    const result = await flushPushQueueNow({ maxTicks, batchSize });
+    return res.json({ ok: true, batchSize, maxTicks, ...result });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Failed to run push worker' });
+  }
+});
+
+app.get('/notifications/campaign/daily/run', requireCronAuth, async (req, res) => {
+  try {
+    const offset = Number(req.query.tzOffsetMinutes || NOTIFICATION_TZ_OFFSET_MINUTES);
+    const dateKey = dateKeyAtOffset(offset);
+    const queued = await queueDailyCampaignNotifications({ dateKey });
+    const push = await flushPushQueueNow({ maxTicks: 20, batchSize: PUSH_WORKER_BATCH_SIZE });
+    return res.json({
+      ok: true,
+      tzOffsetMinutes: offset,
+      queued,
+      push,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Failed to run daily campaign notifications' });
   }
 });
 
@@ -1264,6 +1793,9 @@ app.post('/wallet/withdraw', firebaseAuthMiddleware, async (req, res) => {
     const userRef = db.collection('users').doc(req.user.uid);
     const withdrawRef = db.collection('withdraw_requests').doc();
     const txRef = db.collection('wallet_transactions').doc();
+    let requesterName = '';
+    let requesterPhone = '';
+    let requesterEmail = req.user.email || '';
 
     await db.runTransaction(async (tx) => {
       const userSnap = await tx.get(userRef);
@@ -1273,6 +1805,9 @@ app.post('/wallet/withdraw', firebaseAuthMiddleware, async (req, res) => {
       if (amount > winning) {
         throw new Error('INSUFFICIENT_WINNING');
       }
+      requesterName = (data.name || data.username || '').toString().trim();
+      requesterPhone = (data.phone || data.mobile || '').toString().trim();
+      requesterEmail = (data.email || req.user.email || '').toString().trim();
 
       tx.update(userRef, {
         'wallet.winning': admin.firestore.FieldValue.increment(-amount),
@@ -1285,6 +1820,10 @@ app.post('/wallet/withdraw', firebaseAuthMiddleware, async (req, res) => {
         method,
         upiId,
         status: 'pending',
+        walletTxId: txRef.id,
+        userName: requesterName,
+        userEmail: requesterEmail,
+        userPhone: requesterPhone,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       };
 
@@ -1309,8 +1848,9 @@ app.post('/wallet/withdraw', firebaseAuthMiddleware, async (req, res) => {
       tx.set(withdrawRef, withdrawPayload);
 
       tx.set(txRef, {
+        requestId: withdrawRef.id,
         userId: req.user.uid,
-        type: 'debit',
+        type: 'withdraw_debit',
         status: 'pending',
         amount,
         source: 'withdraw',
@@ -1318,8 +1858,24 @@ app.post('/wallet/withdraw', firebaseAuthMiddleware, async (req, res) => {
       });
     });
 
+    await queueWithdrawRequestAlerts({
+      requestId: withdrawRef.id,
+      userId: req.user.uid,
+      userName: requesterName,
+      userEmail: requesterEmail,
+      userPhone: requesterPhone,
+      amount,
+      method,
+      upiId,
+      accountHolderName,
+      bankAccountNumber,
+      ifsc,
+      bankName,
+      branch,
+    });
+
     await sendEmail({
-      to: req.user.email,
+      to: requesterEmail,
       subject: 'Withdraw request received',
       text: `We received your withdraw request of Rs ${amount}. Status: pending.`,
     });
@@ -1333,6 +1889,110 @@ app.post('/wallet/withdraw', firebaseAuthMiddleware, async (req, res) => {
     return res.status(500).json({ error: 'Withdraw failed' });
   }
 });
+
+async function queueWithdrawRequestAlerts({
+  requestId,
+  userId,
+  userName,
+  userEmail,
+  userPhone,
+  amount,
+  method,
+  upiId,
+  accountHolderName,
+  bankAccountNumber,
+  ifsc,
+  bankName,
+  branch,
+}) {
+  const staffSnap = await db
+    .collection('users')
+    .where('role', 'in', ['admin', 'owner', 'staff', 'creator'])
+    .get();
+  if (staffSnap.empty) return;
+
+  const displayName = (userName || '').trim() || userId;
+  const title = 'New Withdraw Request';
+  const body = `${displayName} requested Rs ${Number(amount).toFixed(2)} via ${(
+    method || 'upi'
+  )
+    .toString()
+    .toUpperCase()}`;
+  const methodLabel = (method || '').toString().trim().toLowerCase();
+
+  let batch = db.batch();
+  let count = 0;
+
+  async function commitBatchIfNeeded(force = false) {
+    if (!force && count < 380) return;
+    if (count === 0) return;
+    await batch.commit();
+    batch = db.batch();
+    count = 0;
+  }
+
+  for (const doc of staffSnap.docs) {
+    const adminId = doc.id;
+    if (!adminId) continue;
+
+    const notifRef = db
+      .collection('users')
+      .doc(adminId)
+      .collection('notifications')
+      .doc();
+    batch.set(notifRef, {
+      userId: adminId,
+      title,
+      body,
+      type: 'withdraw_request_admin',
+      isRead: false,
+      requestId,
+      requestUserId: userId,
+      requestUserName: userName || '',
+      requestUserEmail: userEmail || '',
+      requestUserPhone: userPhone || '',
+      amount,
+      method: methodLabel,
+      upiId: upiId || '',
+      accountHolderName: accountHolderName || '',
+      bankAccountNumber: bankAccountNumber || '',
+      ifsc: ifsc || '',
+      bankName: bankName || '',
+      branch: branch || '',
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    count += 1;
+
+    const pushRef = db.collection('push_notifications_queue').doc();
+    batch.set(pushRef, {
+      userId: adminId,
+      title,
+      body,
+      type: 'withdraw_request_admin',
+      screen: 'admin_wallet',
+      status: 'pending',
+      requestId,
+      requestUserId: userId,
+      requestUserName: userName || '',
+      requestUserEmail: userEmail || '',
+      requestUserPhone: userPhone || '',
+      amount,
+      method: methodLabel,
+      upiId: upiId || '',
+      accountHolderName: accountHolderName || '',
+      bankAccountNumber: bankAccountNumber || '',
+      ifsc: ifsc || '',
+      bankName: bankName || '',
+      branch: branch || '',
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    count += 1;
+
+    await commitBatchIfNeeded(false);
+  }
+
+  await commitBatchIfNeeded(true);
+}
 
 async function finalizeOrderPayment({
   orderId,
@@ -1389,10 +2049,311 @@ async function finalizeOrderPayment({
   });
 }
 
+function normalizePushDataValue(value) {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return value.toString();
+  }
+  try {
+    return JSON.stringify(value);
+  } catch (_err) {
+    return '';
+  }
+}
+
+function extractPushData(payload) {
+  const allowedKeys = [
+    'type',
+    'screen',
+    'route',
+    'matchId',
+    'tournamentId',
+    'chatId',
+    'targetRole',
+    'senderId',
+    'senderRole',
+    'senderName',
+    'userId',
+    'reason',
+    'requestId',
+    'requestUserId',
+    'requestUserName',
+    'requestUserEmail',
+    'requestUserPhone',
+    'amount',
+    'method',
+    'upiId',
+    'accountHolderName',
+    'bankAccountNumber',
+    'ifsc',
+    'bankName',
+    'branch',
+  ];
+  const data = {};
+  for (const key of allowedKeys) {
+    if (!(key in payload)) continue;
+    const value = normalizePushDataValue(payload[key]);
+    if (!value) continue;
+    data[key] = value;
+  }
+  if (!data.type) {
+    data.type = 'generic';
+  }
+  return data;
+}
+
+function isInvalidRegistrationToken(errorCode) {
+  const code = (errorCode || '').toString().toLowerCase();
+  return (
+    code.includes('registration-token-not-registered') ||
+    code.includes('invalid-registration-token') ||
+    code.includes('invalid-argument')
+  );
+}
+
+async function processPendingPushQueue(batchSize = PUSH_WORKER_BATCH_SIZE) {
+  const queueSnap = await db
+    .collection('push_notifications_queue')
+    .where('status', '==', 'pending')
+    .limit(Math.max(1, Number(batchSize) || PUSH_WORKER_BATCH_SIZE))
+    .get();
+
+  if (queueSnap.empty) return { picked: 0, sent: 0, failed: 0 };
+
+  let sent = 0;
+  let failed = 0;
+
+  for (const doc of queueSnap.docs) {
+    const ref = doc.ref;
+    const claimed = await db.runTransaction(async (tx) => {
+      const fresh = await tx.get(ref);
+      if (!fresh.exists) return false;
+      const data = fresh.data() || {};
+      const status = (data.status || 'pending').toString().toLowerCase();
+      if (status !== 'pending') return false;
+      tx.set(
+        ref,
+        {
+          status: 'processing',
+          processingAt: admin.firestore.FieldValue.serverTimestamp(),
+          attempts: admin.firestore.FieldValue.increment(1),
+        },
+        { merge: true }
+      );
+      return true;
+    });
+    if (!claimed) continue;
+
+    try {
+      const freshSnap = await ref.get();
+      const payload = freshSnap.data() || {};
+      const userId = (payload.userId || '').toString().trim();
+      const title = (payload.title || 'Notification').toString();
+      const body = (payload.body || '').toString();
+
+      const tokens = new Set();
+      const directToken = (payload.fcmToken || '').toString().trim();
+      if (directToken) tokens.add(directToken);
+
+      let userSnap = null;
+      let userData = {};
+      if (userId) {
+        userSnap = await db.collection('users').doc(userId).get();
+        userData = userSnap.data() || {};
+        const primary = (userData.fcmToken || '').toString().trim();
+        if (primary) tokens.add(primary);
+        if (Array.isArray(userData.fcmTokens)) {
+          for (const value of userData.fcmTokens) {
+            const token = (value || '').toString().trim();
+            if (token) tokens.add(token);
+          }
+        }
+      }
+
+      const tokenList = Array.from(tokens);
+      if (tokenList.length === 0) {
+        await ref.set(
+          {
+            status: 'failed',
+            errorCode: 'NO_FCM_TOKEN',
+            errorMessage: 'No device token found for user',
+            failedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+        failed += 1;
+        continue;
+      }
+
+      const messageData = extractPushData(payload);
+      const response = await admin.messaging().sendEachForMulticast({
+        tokens: tokenList,
+        notification: {
+          title,
+          body,
+        },
+        data: messageData,
+        android: {
+          priority: 'high',
+          notification: {
+            channelId: 'high_importance_channel',
+            sound: 'default',
+          },
+        },
+      });
+
+      const invalidTokens = [];
+      for (let i = 0; i < response.responses.length; i += 1) {
+        const item = response.responses[i];
+        if (item.success) continue;
+        const code = item.error?.code || '';
+        if (isInvalidRegistrationToken(code)) {
+          invalidTokens.push(tokenList[i]);
+        }
+      }
+
+      if (invalidTokens.length > 0 && userId) {
+        const userRef = db.collection('users').doc(userId);
+        await userRef.set(
+          {
+            fcmTokens: admin.firestore.FieldValue.arrayRemove(...invalidTokens),
+            fcmTokenUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+        const primary = (userData.fcmToken || '').toString().trim();
+        if (primary && invalidTokens.includes(primary)) {
+          await userRef.set(
+            {
+              fcmToken: '',
+              fcmTokenUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+        }
+      }
+
+      if (response.successCount > 0) {
+        await ref.set(
+          {
+            status: 'sent',
+            sentAt: admin.firestore.FieldValue.serverTimestamp(),
+            sentCount: response.successCount,
+            failCount: response.failureCount,
+            invalidTokens,
+          },
+          { merge: true }
+        );
+        sent += 1;
+      } else {
+        await ref.set(
+          {
+            status: 'failed',
+            failCount: response.failureCount,
+            invalidTokens,
+            failedAt: admin.firestore.FieldValue.serverTimestamp(),
+            errorCode: response.responses[0]?.error?.code || 'FCM_SEND_FAILED',
+            errorMessage:
+              response.responses[0]?.error?.message || 'Unable to send notification',
+          },
+          { merge: true }
+        );
+        failed += 1;
+      }
+    } catch (err) {
+      await ref.set(
+        {
+          status: 'failed',
+          errorCode: err?.code || 'FCM_SEND_EXCEPTION',
+          errorMessage: err?.message || 'Unknown push worker error',
+          failedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+      failed += 1;
+    }
+  }
+
+  return { picked: queueSnap.size, sent, failed };
+}
+
+let pushWorkerBusy = false;
+let pushWorkerTimer = null;
+let dailyCampaignBusy = false;
+let dailyCampaignTimer = null;
+let lastDailyCampaignDateKey = '';
+
+async function runPushWorkerTick() {
+  if (pushWorkerBusy) return;
+  pushWorkerBusy = true;
+  try {
+    const result = await processPendingPushQueue(PUSH_WORKER_BATCH_SIZE);
+    if (result.picked > 0) {
+      console.log(
+        `[push-worker] picked=${result.picked}, sent=${result.sent}, failed=${result.failed}`
+      );
+    }
+  } catch (err) {
+    console.error('[push-worker] tick failed', err);
+  } finally {
+    pushWorkerBusy = false;
+  }
+}
+
+function startPushWorker() {
+  if (pushWorkerTimer) return;
+  pushWorkerTimer = setInterval(() => {
+    runPushWorkerTick().catch((err) => {
+      console.error('[push-worker] uncaught tick error', err);
+    });
+  }, PUSH_WORKER_INTERVAL_MS);
+  runPushWorkerTick().catch((err) => {
+    console.error('[push-worker] startup tick error', err);
+  });
+}
+
+async function runDailyCampaignTick(force = false) {
+  if (dailyCampaignBusy) return;
+  const dateKey = dateKeyAtOffset(NOTIFICATION_TZ_OFFSET_MINUTES);
+  if (!force && lastDailyCampaignDateKey === dateKey) return;
+
+  dailyCampaignBusy = true;
+  try {
+    const queued = await queueDailyCampaignNotifications({ dateKey });
+    const push = await flushPushQueueNow({ maxTicks: 20, batchSize: PUSH_WORKER_BATCH_SIZE });
+    lastDailyCampaignDateKey = dateKey;
+    if (queued.queuedNotifications > 0 || push.picked > 0) {
+      console.log(
+        `[daily-campaign] date=${dateKey}, users=${queued.touchedUsers}, queued=${queued.queuedNotifications}, pushSent=${push.sent}, pushFailed=${push.failed}`
+      );
+    }
+  } catch (err) {
+    console.error('[daily-campaign] tick failed', err);
+  } finally {
+    dailyCampaignBusy = false;
+  }
+}
+
+function startDailyCampaignScheduler() {
+  if (dailyCampaignTimer) return;
+  dailyCampaignTimer = setInterval(() => {
+    runDailyCampaignTick(false).catch((err) => {
+      console.error('[daily-campaign] uncaught tick error', err);
+    });
+  }, 15 * 60 * 1000);
+  runDailyCampaignTick(true).catch((err) => {
+    console.error('[daily-campaign] startup tick error', err);
+  });
+}
+
 if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`Razorpay backend running on port ${PORT}`);
+    startPushWorker();
+    startDailyCampaignScheduler();
   });
 }
 
 module.exports = app;
+
