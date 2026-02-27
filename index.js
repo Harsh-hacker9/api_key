@@ -115,6 +115,19 @@ function normalizeOtp(value) {
   return (value || '').toString().replace(/\D/g, '').slice(0, 6);
 }
 
+const TEST_LOGIN_EMAIL = normalizeEmail(
+  process.env.TEST_LOGIN_EMAIL || 'test@gmail.com'
+);
+const TEST_LOGIN_OTP = normalizeOtp(process.env.TEST_LOGIN_OTP || '123456');
+
+function isTestLoginEmail(email) {
+  return normalizeEmail(email) === TEST_LOGIN_EMAIL;
+}
+
+function isTestLoginOtp(email, otp) {
+  return isTestLoginEmail(email) && normalizeOtp(otp) === TEST_LOGIN_OTP;
+}
+
 function escapeHtml(value) {
   return (value || '')
     .toString()
@@ -935,6 +948,15 @@ async function sendOtpHandler(req, res) {
       return res.status(400).json({ success: false, message: 'Invalid email' });
     }
 
+    if (mode === 'login' && isTestLoginEmail(email)) {
+      return res.json({
+        success: true,
+        message: 'OTP sent successfully',
+        ttlSeconds: OTP_TTL_SECONDS,
+        testMode: true,
+      });
+    }
+
     if (mode === 'login') {
       const userProfile = await findUserProfileByEmail(email);
       if (!userProfile) {
@@ -994,13 +1016,24 @@ async function verifyOtpHandler(req, res, options = {}) {
       return res.status(400).json({ success: false, message: 'Invalid input' });
     }
 
-    const verifyResult = await verifyOtpForEmail(email, otp);
-    if (!verifyResult.ok) {
-      return res.status(verifyResult.status).json({
-        success: false,
-        message: verifyResult.message,
-        code: verifyResult.code,
-      });
+    const isTestLogin = mode === 'login' && isTestLoginEmail(email);
+    if (isTestLogin) {
+      if (!isTestLoginOtp(email, otp)) {
+        return res.status(401).json({
+          success: false,
+          message: 'Incorrect OTP. Please try again.',
+          code: 'OTP_INVALID',
+        });
+      }
+    } else {
+      const verifyResult = await verifyOtpForEmail(email, otp);
+      if (!verifyResult.ok) {
+        return res.status(verifyResult.status).json({
+          success: false,
+          message: verifyResult.message,
+          code: verifyResult.code,
+        });
+      }
     }
 
     let user;
@@ -1008,22 +1041,55 @@ async function verifyOtpHandler(req, res, options = {}) {
     const authUser = await getAuthUserByEmail(email);
 
     if (mode === 'login') {
-      if (!profileDoc || !authUser) {
-        return res.status(403).json({
-          success: false,
-          message: 'Please register first',
-          code: 'USER_NOT_REGISTERED',
+      if (isTestLogin) {
+        if (profileDoc && authUser && profileDoc.id !== authUser.uid) {
+          return res.status(403).json({
+            success: false,
+            message: 'Account mismatch. Contact support.',
+            code: 'ACCOUNT_UID_MISMATCH',
+          });
+        }
+
+        if (profileDoc) {
+          try {
+            user = await admin.auth().getUser(profileDoc.id);
+          } catch (err) {
+            if (err?.code === 'auth/user-not-found') {
+              user = await admin.auth().createUser({
+                uid: profileDoc.id,
+                email,
+                emailVerified: true,
+              });
+            } else {
+              throw err;
+            }
+          }
+        } else {
+          user = authUser || (await getOrCreateAuthUserByEmail(email));
+        }
+
+        await ensureUserProfile(user.uid, email, {
+          createIfMissing: true,
+          markRegistered: true,
         });
+      } else {
+        if (!profileDoc || !authUser) {
+          return res.status(403).json({
+            success: false,
+            message: 'Please register first',
+            code: 'USER_NOT_REGISTERED',
+          });
+        }
+        if (profileDoc.id !== authUser.uid) {
+          return res.status(403).json({
+            success: false,
+            message: 'Account mismatch. Contact support.',
+            code: 'ACCOUNT_UID_MISMATCH',
+          });
+        }
+        user = authUser;
+        await ensureUserProfile(user.uid, email, { createIfMissing: false });
       }
-      if (profileDoc.id !== authUser.uid) {
-        return res.status(403).json({
-          success: false,
-          message: 'Account mismatch. Contact support.',
-          code: 'ACCOUNT_UID_MISMATCH',
-        });
-      }
-      user = authUser;
-      await ensureUserProfile(user.uid, email, { createIfMissing: false });
     } else {
       if (profileDoc) {
         return res.status(409).json({
@@ -2356,4 +2422,5 @@ if (require.main === module) {
 }
 
 module.exports = app;
+
 
