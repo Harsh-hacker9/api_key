@@ -1313,15 +1313,11 @@ app.post('/notifications/push/flush', firebaseAuthMiddleware, async (req, res) =
   try {
     const meSnap = await db.collection('users').doc(req.user.uid).get();
     const role = (meSnap.data()?.role || '').toString();
-    if (!isStaffRoleValue(role)) {
-      return res.status(403).json({ error: 'Only staff can process push queue' });
-    }
-    const size = Math.max(
-      1,
-      Math.min(200, Number(req.body?.batchSize || PUSH_WORKER_BATCH_SIZE) || PUSH_WORKER_BATCH_SIZE)
-    );
+    const isStaff = isStaffRoleValue(role);
+    const requestedSize = Number(req.body?.batchSize || PUSH_WORKER_BATCH_SIZE) || PUSH_WORKER_BATCH_SIZE;
+    const size = Math.max(1, Math.min(isStaff ? 200 : 40, requestedSize));
     const result = await processPendingPushQueue(size);
-    return res.json({ ok: true, ...result });
+    return res.json({ ok: true, batchSize: size, requestedByRole: role || 'user', ...result });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: 'Failed to process push queue' });
