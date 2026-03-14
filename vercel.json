@@ -11,10 +11,6 @@
       "handle": "filesystem"
     },
     {
-      "src": "^/updates/(.*)$",
-      "dest": "/public/updates/$1"
-    },
-    {
       "src": "/(.*)",
       "dest": "/index.js"
     }
