@@ -27,51 +27,58 @@ jobs:
 
           mkdir -p updates
 
-          # Find the latest and previous APKs by versionCode in filename: app_<code>.apk
+          # Find APKs by versionCode in filename: app_<code>.apk (sorted ascending).
           mapfile -t apks < <(ls -1 updates/app_*.apk 2>/dev/null | sed -E 's/.*app_([0-9]+)\.apk/\1 \0/' | sort -n | awk '{print $2}')
           if [ "${#apks[@]}" -lt 2 ]; then
             echo "Need at least two APKs in updates/: updates/app_<old>.apk and updates/app_<new>.apk"
             exit 1
           fi
 
-          old_apk="${apks[-2]}"
-          new_apk="${apks[-1]}"
+          latest_apk="${apks[-1]}"
+          latest_v="$(echo "$latest_apk" | sed -E 's/.*app_([0-9]+)\.apk/\1/')"
+          latest_sha="$(sha256sum "$latest_apk" | awk '{print $1}')"
+          latest_size="$(wc -c < "$latest_apk" | tr -d ' ')"
 
-          old_v="$(echo "$old_apk" | sed -E 's/.*app_([0-9]+)\.apk/\1/')"
-          new_v="$(echo "$new_apk" | sed -E 's/.*app_([0-9]+)\.apk/\1/')"
-
-          patch="updates/${old_v}_${new_v}.patch"
-          json="updates/update_${old_v}_${new_v}.json"
-
-          echo "Old: $old_apk (v=$old_v)"
-          echo "New: $new_apk (v=$new_v)"
-          echo "Patch: $patch"
-
-          bsdiff "$old_apk" "$new_apk" "$patch"
-
-          patch_size="$(wc -c < "$patch" | tr -d ' ')"
-          patch_sha="$(sha256sum "$patch" | awk '{print $1}')"
-          new_sha="$(sha256sum "$new_apk" | awk '{print $1}')"
-          new_size="$(wc -c < "$new_apk" | tr -d ' ')"
-
-          cat > "$json" <<EOF
-          {
-            "fromVersion": ${old_v},
-            "toVersion": ${new_v},
-            "patchUrl": "https://apikey-fawn.vercel.app/updates/${old_v}_${new_v}.patch",
-            "patchSha256": "${patch_sha}",
-            "patchSizeBytes": ${patch_size},
-            "resultApkSha256": "${new_sha}",
-            "apkUrl": "https://apikey-fawn.vercel.app/updates/app_${new_v}.apk",
-            "apkSha256": "${new_sha}",
-            "apkSizeBytes": ${new_size}
-          }
-          EOF
-
-          echo "Generated $patch and $json"
+          echo "Latest: $latest_apk (v=$latest_v)"
+          echo "Latest sha256: $latest_sha"
+          echo "Latest size: $latest_size"
           echo ""
-          echo "Firestore deltaPatches item:"
-          echo "{\"fromVersion\":${old_v},\"toVersion\":${new_v},\"patchUrl\":\"https://apikey-fawn.vercel.app/updates/${old_v}_${new_v}.patch\",\"patchSha256\":\"${patch_sha}\",\"patchSizeBytes\":${patch_size},\"resultApkSha256\":\"${new_sha}\"}"
+
+          echo "Generating delta patches for consecutive versions (chain-friendly):"
+          for ((i=0; i<${#apks[@]}-1; i++)); do
+            old_apk="${apks[$i]}"
+            new_apk="${apks[$i+1]}"
+            old_v="$(echo "$old_apk" | sed -E 's/.*app_([0-9]+)\.apk/\1/')"
+            new_v="$(echo "$new_apk" | sed -E 's/.*app_([0-9]+)\.apk/\1/')"
+
+            patch="updates/${old_v}_${new_v}.patch"
+            json="updates/update_${old_v}_${new_v}.json"
+
+            echo " - $old_v -> $new_v"
+            bsdiff "$old_apk" "$new_apk" "$patch"
+
+            patch_size="$(wc -c < "$patch" | tr -d ' ')"
+            patch_sha="$(sha256sum "$patch" | awk '{print $1}')"
+            new_sha="$(sha256sum "$new_apk" | awk '{print $1}')"
+            new_size="$(wc -c < "$new_apk" | tr -d ' ')"
+
+            cat > "$json" <<EOF
+            {
+              "fromVersion": ${old_v},
+              "toVersion": ${new_v},
+              "patchUrl": "https://apikey-fawn.vercel.app/updates/${old_v}_${new_v}.patch",
+              "patchSha256": "${patch_sha}",
+              "patchSizeBytes": ${patch_size},
+              "resultApkSha256": "${new_sha}",
+              "apkUrl": "https://apikey-fawn.vercel.app/updates/app_${latest_v}.apk",
+              "apkSha256": "${latest_sha}",
+              "apkSizeBytes": ${latest_size}
+            }
+            EOF
+
+            echo "   Firestore deltaPatches item:"
+            echo "   {\"fromVersion\":${old_v},\"toVersion\":${new_v},\"patchUrl\":\"https://apikey-fawn.vercel.app/updates/${old_v}_${new_v}.patch\",\"patchSha256\":\"${patch_sha}\",\"patchSizeBytes\":${patch_size},\"resultApkSha256\":\"${new_sha}\"}"
+          done
 
       - name: Commit patch
         shell: bash
@@ -86,4 +93,3 @@ jobs:
           fi
           git commit -m "Generate delta patch"
           git push
-
