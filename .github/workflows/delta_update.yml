@@ -67,19 +67,38 @@ jobs:
             new_sha="$(sha256sum "$new_apk" | awk '{print $1}')"
             new_size="$(wc -c < "$new_apk" | tr -d ' ')"
 
-            cat > "$json" <<EOF
-            {
-              "fromVersion": ${old_v},
-              "toVersion": ${new_v},
-              "patchUrl": "https://apikey-fawn.vercel.app/updates/${old_v}_${new_v}.patch",
-              "patchSha256": "${patch_sha}",
-              "patchSizeBytes": ${patch_size},
-              "resultApkSha256": "${new_sha}",
-              "apkUrl": "https://apikey-fawn.vercel.app/updates/app_${latest_v}.apk",
-              "apkSha256": "${latest_sha}",
-              "apkSizeBytes": ${latest_size}
-            }
-            EOF
+            python3 - "$json" "$old_v" "$new_v" "$patch_sha" "$patch_size" "$new_sha" "$latest_v" "$latest_sha" "$latest_size" <<'PY'
+import json
+import sys
+
+(
+    out_path,
+    old_v,
+    new_v,
+    patch_sha,
+    patch_size,
+    result_apk_sha,
+    latest_v,
+    latest_sha,
+    latest_size,
+) = sys.argv[1:]
+
+payload = {
+    "fromVersion": int(old_v),
+    "toVersion": int(new_v),
+    "patchUrl": f"https://apikey-fawn.vercel.app/updates/{old_v}_{new_v}.patch",
+    "patchSha256": patch_sha,
+    "patchSizeBytes": int(patch_size),
+    "resultApkSha256": result_apk_sha,
+    "apkUrl": f"https://apikey-fawn.vercel.app/updates/app_{latest_v}.apk",
+    "apkSha256": latest_sha,
+    "apkSizeBytes": int(latest_size),
+}
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(payload, f, indent=2, sort_keys=True)
+    f.write("\n")
+PY
 
             echo "   Firestore deltaPatches item:"
             echo "   {\"fromVersion\":${old_v},\"toVersion\":${new_v},\"patchUrl\":\"https://apikey-fawn.vercel.app/updates/${old_v}_${new_v}.patch\",\"patchSha256\":\"${patch_sha}\",\"patchSizeBytes\":${patch_size},\"resultApkSha256\":\"${new_sha}\"}"
