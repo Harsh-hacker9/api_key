@@ -1,0 +1,89 @@
+name: Delta update patch
+
+on:
+  push:
+    paths:
+      - "updates/app_*.apk"
+
+permissions:
+  contents: write
+
+jobs:
+  make-patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install bsdiff
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bsdiff coreutils
+
+      - name: Generate patch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p updates
+
+          # Find the latest and previous APKs by versionCode in filename: app_<code>.apk
+          mapfile -t apks < <(ls -1 updates/app_*.apk 2>/dev/null | sed -E 's/.*app_([0-9]+)\.apk/\1 \0/' | sort -n | awk '{print $2}')
+          if [ "${#apks[@]}" -lt 2 ]; then
+            echo "Need at least two APKs in updates/: updates/app_<old>.apk and updates/app_<new>.apk"
+            exit 1
+          fi
+
+          old_apk="${apks[-2]}"
+          new_apk="${apks[-1]}"
+
+          old_v="$(echo "$old_apk" | sed -E 's/.*app_([0-9]+)\.apk/\1/')"
+          new_v="$(echo "$new_apk" | sed -E 's/.*app_([0-9]+)\.apk/\1/')"
+
+          patch="updates/${old_v}_${new_v}.patch"
+          json="updates/update_${old_v}_${new_v}.json"
+
+          echo "Old: $old_apk (v=$old_v)"
+          echo "New: $new_apk (v=$new_v)"
+          echo "Patch: $patch"
+
+          bsdiff "$old_apk" "$new_apk" "$patch"
+
+          patch_size="$(wc -c < "$patch" | tr -d ' ')"
+          patch_sha="$(sha256sum "$patch" | awk '{print $1}')"
+          new_sha="$(sha256sum "$new_apk" | awk '{print $1}')"
+          new_size="$(wc -c < "$new_apk" | tr -d ' ')"
+
+          cat > "$json" <<EOF
+          {
+            "fromVersion": ${old_v},
+            "toVersion": ${new_v},
+            "patchUrl": "https://apikey-fawn.vercel.app/updates/${old_v}_${new_v}.patch",
+            "patchSha256": "${patch_sha}",
+            "patchSizeBytes": ${patch_size},
+            "resultApkSha256": "${new_sha}",
+            "apkUrl": "https://apikey-fawn.vercel.app/updates/app_${new_v}.apk",
+            "apkSha256": "${new_sha}",
+            "apkSizeBytes": ${new_size}
+          }
+          EOF
+
+          echo "Generated $patch and $json"
+          echo ""
+          echo "Firestore deltaPatches item:"
+          echo "{\"fromVersion\":${old_v},\"toVersion\":${new_v},\"patchUrl\":\"https://apikey-fawn.vercel.app/updates/${old_v}_${new_v}.patch\",\"patchSha256\":\"${patch_sha}\",\"patchSizeBytes\":${patch_size},\"resultApkSha256\":\"${new_sha}\"}"
+
+      - name: Commit patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add updates/*.patch updates/update_*.json || true
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "Generate delta patch"
+          git push
+
