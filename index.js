@@ -2105,9 +2105,10 @@ app.post('/prizes/coin/assign', firebaseAuthMiddleware, async (req, res) => {
       const lockSnap = await tx.get(lockRef);
       if (lockSnap.exists) {
         const cost = toAmount(liveReward.coinCost || liveReward.amount || 0);
-        const deduction = liveReward.walletDeduction && typeof liveReward.walletDeduction === 'object'
-          ? liveReward.walletDeduction
-          : {};
+        const deduction =
+          liveReward.walletDeduction && typeof liveReward.walletDeduction === 'object'
+            ? liveReward.walletDeduction
+            : {};
         const refundBonus = toAmount(deduction.bonus || 0);
         const refundWinning = toAmount(deduction.winning || 0);
         const refundDeposit = toAmount(deduction.deposit || 0);
