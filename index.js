@@ -1936,6 +1936,12 @@ app.post('/wallet/withdraw', firebaseAuthMiddleware, async (req, res) => {
       branch,
     });
 
+    try {
+      await processPendingPushQueue(40);
+    } catch (_) {
+      // Best-effort: email + in-app notifications still exist.
+    }
+
     await sendEmail({
       to: requesterEmail,
       subject: 'Withdraw request received',
@@ -1949,6 +1955,297 @@ app.post('/wallet/withdraw', firebaseAuthMiddleware, async (req, res) => {
     }
     console.error(err);
     return res.status(500).json({ error: 'Withdraw failed' });
+  }
+});
+
+app.post('/wallet/deposit/manual-request', firebaseAuthMiddleware, async (req, res) => {
+  try {
+    const requestId = (req.body.requestId || '').toString().trim();
+    const amount = Number(req.body.amount);
+    const utr = (req.body.utr || '').toString().trim();
+    const screenshotPath = (req.body.screenshotPath || '').toString().trim();
+    const screenshotUrl = (req.body.screenshotUrl || '').toString().trim();
+    const vpa = (req.body.vpa || '').toString().trim();
+    const payeeName = (req.body.payeeName || '').toString().trim();
+
+    if (!requestId || requestId.length < 8) {
+      return res.status(400).json({ error: 'Invalid requestId' });
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'Invalid amount' });
+    }
+    if (!utr || utr.length < 6) {
+      return res.status(400).json({ error: 'UTR required' });
+    }
+    if (!screenshotPath || !screenshotUrl) {
+      return res.status(400).json({ error: 'Screenshot required' });
+    }
+    if (!screenshotPath.startsWith(`deposit_requests/${req.user.uid}/`)) {
+      return res.status(400).json({ error: 'Invalid screenshotPath' });
+    }
+
+    const userRef = db.collection('users').doc(req.user.uid);
+    const depositRef = db.collection('deposit_requests').doc(requestId);
+
+    let requesterName = '';
+    let requesterPhone = '';
+    let requesterEmail = req.user.email || '';
+
+    await db.runTransaction(async (tx) => {
+      const existsSnap = await tx.get(depositRef);
+      if (existsSnap.exists) {
+        throw new Error('REQUEST_EXISTS');
+      }
+
+      const userSnap = await tx.get(userRef);
+      const data = userSnap.data() || {};
+      requesterName = (data.name || data.username || '').toString().trim();
+      requesterPhone = (data.phone || data.mobile || '').toString().trim();
+      requesterEmail = (data.email || req.user.email || '').toString().trim();
+
+      tx.set(depositRef, {
+        userId: req.user.uid,
+        amount,
+        utr,
+        screenshotPath,
+        screenshotUrl,
+        vpa,
+        payeeName,
+        status: 'pending',
+        userName: requesterName,
+        userEmail: requesterEmail,
+        userPhone: requesterPhone,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    });
+
+    await queueManualDepositRequestAlerts({
+      requestId,
+      userId: req.user.uid,
+      userName: requesterName,
+      userEmail: requesterEmail,
+      userPhone: requesterPhone,
+      amount,
+      utr,
+    });
+
+    try {
+      await processPendingPushQueue(40);
+    } catch (_) {}
+
+    return res.json({ ok: true, requestId });
+  } catch (err) {
+    console.error(err);
+    if ((err && err.message) === 'REQUEST_EXISTS') {
+      return res.status(409).json({ error: 'Request already exists' });
+    }
+    return res.status(500).json({ error: 'Deposit request failed' });
+  }
+});
+
+app.post('/prizes/coin/assign', firebaseAuthMiddleware, async (req, res) => {
+  try {
+    const rewardId = (req.body.rewardId || '').toString().trim();
+    if (!rewardId || rewardId.length < 8) {
+      return res.status(400).json({ error: 'Invalid rewardId' });
+    }
+
+    const rewardRef = db.collection('reward_redemptions').doc(rewardId);
+    const rewardSnap = await rewardRef.get();
+    if (!rewardSnap.exists) {
+      return res.status(404).json({ error: 'Reward not found' });
+    }
+
+    const reward = rewardSnap.data() || {};
+    const type = (reward.type || '').toString().trim().toLowerCase();
+    const status = (reward.status || '').toString().trim().toLowerCase();
+    const userId = (reward.userId || '').toString().trim();
+    const prizeId = (reward.prizeId || '').toString().trim();
+
+    if (!userId || userId !== req.user.uid) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    if (type !== 'coin_prize') {
+      return res.status(400).json({ error: 'Invalid reward type' });
+    }
+    if (status !== 'pending_code') {
+      return res.json({ ok: true, status: status || 'unknown' });
+    }
+    if (!prizeId) {
+      return res.status(400).json({ error: 'Invalid prizeId' });
+    }
+
+    const prizeRef = db.collection('prize_catalog').doc(prizeId);
+    const prizeSnap = await prizeRef.get();
+    if (!prizeSnap.exists) {
+      return res.status(404).json({ error: 'Prize not found' });
+    }
+    const prize = prizeSnap.data() || {};
+    const redeemCode = (prize.redeemCode || '').toString().trim();
+    const redeemPin = (prize.redeemPin || '').toString().trim();
+    if (!redeemCode) {
+      return res.status(409).json({ error: 'Redeem code not configured' });
+    }
+
+    const lockRef = db.collection('prize_redemption_locks').doc(prizeId);
+    const userRef = db.collection('users').doc(userId);
+    const walletTxRef = db.collection('wallet_transactions').doc();
+
+    let assigned = false;
+    let refunded = false;
+
+    await db.runTransaction(async (tx) => {
+      const liveRewardSnap = await tx.get(rewardRef);
+      const liveReward = liveRewardSnap.exists ? liveRewardSnap.data() || {} : {};
+      const liveType = (liveReward.type || '').toString().trim().toLowerCase();
+      const liveStatus = (liveReward.status || '').toString().trim().toLowerCase();
+      if (liveType !== 'coin_prize' || liveStatus !== 'pending_code') return;
+
+      const lockSnap = await tx.get(lockRef);
+      if (lockSnap.exists) {
+        const cost = toAmount(liveReward.coinCost || liveReward.amount || 0);
+        const deduction = liveReward.walletDeduction && typeof liveReward.walletDeduction === 'object'
+          ? liveReward.walletDeduction
+          : {};
+        const refundBonus = toAmount(deduction.bonus || 0);
+        const refundWinning = toAmount(deduction.winning || 0);
+        const refundDeposit = toAmount(deduction.deposit || 0);
+        const refundTotal = toAmount(deduction.total || cost || 0);
+
+        if (refundBonus || refundWinning || refundDeposit || refundTotal) {
+          refunded = true;
+          tx.set(
+            userRef,
+            {
+              wallet: {
+                bonus: admin.firestore.FieldValue.increment(refundBonus),
+                winning: admin.firestore.FieldValue.increment(refundWinning),
+                deposit: admin.firestore.FieldValue.increment(refundDeposit),
+                total: admin.firestore.FieldValue.increment(refundTotal),
+              },
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+
+          tx.set(walletTxRef, {
+            userId,
+            type: 'coin_prize_refund',
+            amount: refundTotal,
+            mode: 'credit',
+            status: 'success',
+            prizeId,
+            rewardId,
+            note: 'Refund: redeem code already used.',
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        }
+
+        tx.set(
+          rewardRef,
+          {
+            status: refunded ? 'rejected_refunded' : 'rejected',
+            note: 'This redeem code is already used.',
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+        return;
+      }
+
+      tx.set(lockRef, {
+        prizeId,
+        userId,
+        rewardId,
+        redeemCode,
+        redeemPin,
+        claimedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      tx.set(
+        rewardRef,
+        {
+          redeemCode,
+          redeemPin,
+          status: 'assigned',
+          assignedAt: admin.firestore.FieldValue.serverTimestamp(),
+          assignedByRole: 'system',
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      tx.set(
+        prizeRef,
+        {
+          isActive: false,
+          claimedBy: userId,
+          claimedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      const inAppRef = userRef.collection('notifications').doc(`reward_${rewardId}`);
+      const pushRef = db.collection('push_notifications_queue').doc(`reward_${rewardId}_${userId}`);
+      const title = 'Redeem Code Assigned';
+      const body = 'Your prize redeem code is ready. Open My Redeem Codes.';
+
+      tx.set(
+        inAppRef,
+        {
+          userId,
+          title,
+          body,
+          type: 'reward_code_assigned',
+          screen: 'redeem_codes',
+          rewardId,
+          prizeId,
+          isRead: false,
+          createdById: 'system',
+          createdByRole: 'system',
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+      tx.set(
+        pushRef,
+        {
+          userId,
+          title,
+          body,
+          type: 'reward_code_assigned',
+          screen: 'redeem_codes',
+          rewardId,
+          prizeId,
+          status: 'pending',
+          createdById: 'system',
+          createdByRole: 'system',
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      assigned = true;
+    });
+
+    if (assigned) {
+      try {
+        await processPendingPushQueue(40);
+      } catch (_) {}
+    }
+
+    return res.json({
+      ok: true,
+      assigned,
+      refunded,
+      redeemCode: assigned ? redeemCode : undefined,
+      redeemPin: assigned ? redeemPin : undefined,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Failed to assign redeem code' });
   }
 });
 
@@ -2056,6 +2353,89 @@ async function queueWithdrawRequestAlerts({
   await commitBatchIfNeeded(true);
 }
 
+async function queueManualDepositRequestAlerts({
+  requestId,
+  userId,
+  userName,
+  userEmail,
+  userPhone,
+  amount,
+  utr,
+}) {
+  const staffSnap = await db
+    .collection('users')
+    .where('role', 'in', ['admin', 'owner', 'staff', 'creator'])
+    .get();
+  if (staffSnap.empty) return;
+
+  const displayName = (userName || '').trim() || userId;
+  const title = 'New Deposit Request';
+  const body = `${displayName} submitted Rs ${Number(amount).toFixed(
+    2
+  )} (UTR: ${utr})`;
+
+  let batch = db.batch();
+  let count = 0;
+
+  async function commitBatchIfNeeded(force = false) {
+    if (!force && count < 380) return;
+    if (count === 0) return;
+    await batch.commit();
+    batch = db.batch();
+    count = 0;
+  }
+
+  for (const doc of staffSnap.docs) {
+    const adminId = doc.id;
+    if (!adminId) continue;
+
+    const notifRef = db
+      .collection('users')
+      .doc(adminId)
+      .collection('notifications')
+      .doc();
+    batch.set(notifRef, {
+      userId: adminId,
+      title,
+      body,
+      type: 'deposit_request_admin',
+      isRead: false,
+      requestId,
+      requestUserId: userId,
+      requestUserName: userName || '',
+      requestUserEmail: userEmail || '',
+      requestUserPhone: userPhone || '',
+      amount,
+      utr,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    count += 1;
+
+    const pushRef = db.collection('push_notifications_queue').doc();
+    batch.set(pushRef, {
+      userId: adminId,
+      title,
+      body,
+      type: 'deposit_request_admin',
+      screen: 'admin_wallet',
+      status: 'pending',
+      requestId,
+      requestUserId: userId,
+      requestUserName: userName || '',
+      requestUserEmail: userEmail || '',
+      requestUserPhone: userPhone || '',
+      amount,
+      utr,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    count += 1;
+
+    await commitBatchIfNeeded(false);
+  }
+
+  await commitBatchIfNeeded(true);
+}
+
 async function finalizeOrderPayment({
   orderId,
   paymentId,
@@ -2144,6 +2524,7 @@ function extractPushData(payload) {
     'requestUserEmail',
     'requestUserPhone',
     'amount',
+    'utr',
     'method',
     'upiId',
     'accountHolderName',
