@@ -4,6 +4,7 @@ const Razorpay = require('razorpay');
 const crypto = require('crypto');
 const cors = require('cors');
 const morgan = require('morgan');
+const path = require('path');
 const admin = require('firebase-admin');
 const nodemailer = require('nodemailer');
 
@@ -96,6 +97,18 @@ const razorpay = new Razorpay({
 const app = express();
 app.use(cors());
 app.use(morgan('tiny'));
+
+// Serve app updates (APK + delta patches) from `public/updates/*`.
+// This keeps `/updates/app_4.apk` working even when Vercel routes hit `index.js`.
+app.use(
+  '/updates',
+  express.static(path.join(__dirname, 'public', 'updates'), {
+    fallthrough: false,
+    setHeaders: (res) => {
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+    },
+  })
+);
 
 const mailer =
   SMTP_HOST && SMTP_USER && SMTP_PASS
