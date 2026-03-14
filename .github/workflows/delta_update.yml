@@ -5,6 +5,10 @@ on:
     paths:
       - "updates/app_*.apk"
 
+concurrency:
+  group: delta-update-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
@@ -34,7 +38,8 @@ jobs:
             exit 1
           fi
 
-          latest_apk="${apks[-1]}"
+          last_index="$((${#apks[@]} - 1))"
+          latest_apk="${apks[$last_index]}"
           latest_v="$(echo "$latest_apk" | sed -E 's/.*app_([0-9]+)\.apk/\1/')"
           latest_sha="$(sha256sum "$latest_apk" | awk '{print $1}')"
           latest_size="$(wc -c < "$latest_apk" | tr -d ' ')"
@@ -86,6 +91,8 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git pull --rebase origin main
           git add updates/*.patch updates/update_*.json || true
           if git diff --cached --quiet; then
             echo "No changes to commit"
