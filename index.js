@@ -1977,10 +1977,13 @@ app.post('/wallet/deposit/manual-request', firebaseAuthMiddleware, async (req, r
     if (!utr || utr.length < 6) {
       return res.status(400).json({ error: 'UTR required' });
     }
-    if (!screenshotPath || !screenshotUrl) {
+    if (!screenshotUrl) {
       return res.status(400).json({ error: 'Screenshot required' });
     }
-    if (!screenshotPath.startsWith(`deposit_requests/${req.user.uid}/`)) {
+    if (
+      screenshotPath &&
+      !screenshotPath.startsWith(`deposit_requests/${req.user.uid}/`)
+    ) {
       return res.status(400).json({ error: 'Invalid screenshotPath' });
     }
 
