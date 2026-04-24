@@ -1202,6 +1202,25 @@ function dateKeyAtOffset(offsetMinutes = NOTIFICATION_TZ_OFFSET_MINUTES) {
   return shifted.toISOString().slice(0, 10);
 }
 
+function toEpochMs(value) {
+  if (!value) return 0;
+  if (value instanceof Date) return value.getTime();
+  if (typeof value.toMillis === 'function') {
+    const ms = Number(value.toMillis());
+    return Number.isFinite(ms) ? ms : 0;
+  }
+  if (typeof value === 'string') {
+    const ms = Date.parse(value);
+    return Number.isFinite(ms) ? ms : 0;
+  }
+  if (typeof value === 'object' && value !== null && 'seconds' in value) {
+    const seconds = Number(value.seconds || 0);
+    const nanoseconds = Number(value.nanoseconds || 0);
+    return seconds * 1000 + Math.floor(nanoseconds / 1000000);
+  }
+  return 0;
+}
+
 function requireCronAuth(req, res, next) {
   if (!CRON_SECRET) {
     return res.status(503).json({ error: 'CRON_SECRET not configured' });
@@ -1316,8 +1335,15 @@ app.post('/notifications/push/flush', firebaseAuthMiddleware, async (req, res) =
     const isStaff = isStaffRoleValue(role);
     const requestedSize = Number(req.body?.batchSize || PUSH_WORKER_BATCH_SIZE) || PUSH_WORKER_BATCH_SIZE;
     const size = Math.max(1, Math.min(isStaff ? 200 : 40, requestedSize));
-    const result = await processPendingPushQueue(size);
-    return res.json({ ok: true, batchSize: size, requestedByRole: role || 'user', ...result });
+    const maxTicks = isStaff ? 4 : 2;
+    const result = await flushPushQueueNow({ batchSize: size, maxTicks });
+    return res.json({
+      ok: true,
+      batchSize: size,
+      maxTicks,
+      requestedByRole: role || 'user',
+      ...result,
+    });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: 'Failed to process push queue' });
@@ -1569,6 +1595,130 @@ async function queueDailyCampaignNotifications({ dateKey }) {
     queuedNotifications,
   };
 }
+
+async function queueUpcomingMatchReminderNotifications({
+  nowMs = Date.now(),
+  leadMinutes = 10,
+} = {}) {
+  const reminderLeadMinutes = Math.max(1, Math.min(60, Number(leadMinutes) || 10));
+  const startFrom = admin.firestore.Timestamp.fromMillis(nowMs);
+  const startTo = admin.firestore.Timestamp.fromMillis(
+    nowMs + reminderLeadMinutes * 60 * 1000
+  );
+  const matchesSnap = await db
+    .collection('matches')
+    .where('startAt', '>=', startFrom)
+    .where('startAt', '<=', startTo)
+    .get();
+
+  let queuedMatches = 0;
+  let queuedNotifications = 0;
+
+  for (const doc of matchesSnap.docs) {
+    const data = doc.data() || {};
+    const status = (data.resultStatus || data.status || '').toString().trim().toLowerCase();
+    if (status === 'completed' || status === 'cancelled') continue;
+
+    const startAtMs = toEpochMs(data.startAt || data.dateTime);
+    if (startAtMs <= 0) continue;
+
+    const reminderKey = `${reminderLeadMinutes}_${Math.floor(startAtMs / 60000)}`;
+    const notificationsMeta =
+      data.notifications && typeof data.notifications === 'object' ? data.notifications : {};
+    if ((notificationsMeta.preMatchReminderKey || '').toString() === reminderKey) {
+      continue;
+    }
+
+    const participantsSnap = await doc.ref.collection('participants').get();
+    if (participantsSnap.empty) continue;
+
+    const title = (data.title || 'Match').toString().trim() || 'Match';
+    const body = `${title} is starting in ${reminderLeadMinutes} minutes. Join now and move to live room.`;
+
+    let batch = db.batch();
+    let opCount = 0;
+    const commitIfNeeded = async (force = false) => {
+      if (!force && opCount < 360) return;
+      if (opCount === 0) return;
+      await batch.commit();
+      batch = db.batch();
+      opCount = 0;
+    };
+
+    for (const participant of participantsSnap.docs) {
+      const uid = participant.id.trim();
+      if (!uid) continue;
+
+      const notifRef = db
+        .collection('users')
+        .doc(uid)
+        .collection('notifications')
+        .doc(`match_starting_soon_${doc.id}_${reminderKey}`);
+      batch.set(
+        notifRef,
+        {
+          userId: uid,
+          title,
+          body,
+          type: 'match_starting_soon',
+          screen: 'tournament',
+          matchId: doc.id,
+          tournamentId: doc.id,
+          isRead: false,
+          createdById: 'system',
+          createdByRole: 'system',
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+      opCount += 1;
+
+      const pushRef = db
+        .collection('push_notifications_queue')
+        .doc(`match_starting_soon_${doc.id}_${uid}_${reminderKey}`);
+      batch.set(
+        pushRef,
+        {
+          userId: uid,
+          title,
+          body,
+          type: 'match_starting_soon',
+          screen: 'tournament',
+          matchId: doc.id,
+          tournamentId: doc.id,
+          status: 'pending',
+          createdById: 'system',
+          createdByRole: 'system',
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+      opCount += 1;
+      queuedNotifications += 1;
+
+      await commitIfNeeded(false);
+    }
+
+    batch.set(
+      doc.ref,
+      {
+        'notifications.preMatchReminderKey': reminderKey,
+        'notifications.preMatchReminderSentAt': admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    opCount += 1;
+    await commitIfNeeded(true);
+    queuedMatches += 1;
+  }
+
+  return {
+    queuedMatches,
+    queuedNotifications,
+    leadMinutes: reminderLeadMinutes,
+  };
+}
 app.get('/notifications/push/worker/run', requireCronAuth, async (req, res) => {
   try {
     const batchSize = Math.max(
@@ -1599,6 +1749,23 @@ app.get('/notifications/campaign/daily/run', requireCronAuth, async (req, res) =
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: 'Failed to run daily campaign notifications' });
+  }
+});
+
+app.get('/notifications/match-reminders/run', requireCronAuth, async (req, res) => {
+  try {
+    const leadMinutes = Math.max(1, Math.min(60, Number(req.query.leadMinutes || 10) || 10));
+    const queued = await queueUpcomingMatchReminderNotifications({ leadMinutes });
+    const push = await flushPushQueueNow({ maxTicks: 20, batchSize: PUSH_WORKER_BATCH_SIZE });
+    return res.json({
+      ok: true,
+      leadMinutes,
+      queued,
+      push,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Failed to run match reminder notifications' });
   }
 });
 
@@ -1920,6 +2087,8 @@ app.post('/wallet/withdraw', firebaseAuthMiddleware, async (req, res) => {
       });
     });
 
+    const staffDocs = await getActiveStaffAlertDocs();
+
     await queueWithdrawRequestAlerts({
       requestId: withdrawRef.id,
       userId: req.user.uid,
@@ -1934,12 +2103,34 @@ app.post('/wallet/withdraw', firebaseAuthMiddleware, async (req, res) => {
       ifsc,
       bankName,
       branch,
+      staffDocs,
     });
 
     try {
-      await processPendingPushQueue(40);
+      await flushPushQueueNow({ batchSize: 80, maxTicks: 4 });
     } catch (_) {
       // Best-effort: email + in-app notifications still exist.
+    }
+
+    try {
+      await sendWithdrawRequestAlertEmails({
+        requestId: withdrawRef.id,
+        userId: req.user.uid,
+        userName: requesterName,
+        userEmail: requesterEmail,
+        userPhone: requesterPhone,
+        amount,
+        method,
+        upiId,
+        accountHolderName,
+        bankAccountNumber,
+        ifsc,
+        bankName,
+        branch,
+        staffDocs,
+      });
+    } catch (err) {
+      console.error('[withdraw-alert-email] failed', err);
     }
 
     await sendEmail({
@@ -2023,6 +2214,8 @@ app.post('/wallet/deposit/manual-request', firebaseAuthMiddleware, async (req, r
       });
     });
 
+    const staffDocs = await getActiveStaffAlertDocs();
+
     await queueManualDepositRequestAlerts({
       requestId,
       userId: req.user.uid,
@@ -2031,11 +2224,27 @@ app.post('/wallet/deposit/manual-request', firebaseAuthMiddleware, async (req, r
       userPhone: requesterPhone,
       amount,
       utr,
+      staffDocs,
     });
 
     try {
-      await processPendingPushQueue(40);
+      await flushPushQueueNow({ batchSize: 80, maxTicks: 4 });
     } catch (_) {}
+
+    try {
+      await sendManualDepositRequestAlertEmails({
+        requestId,
+        userId: req.user.uid,
+        userName: requesterName,
+        userEmail: requesterEmail,
+        userPhone: requesterPhone,
+        amount,
+        utr,
+        staffDocs,
+      });
+    } catch (err) {
+      console.error('[deposit-alert-email] failed', err);
+    }
 
     return res.json({ ok: true, requestId });
   } catch (err) {
@@ -2044,6 +2253,172 @@ app.post('/wallet/deposit/manual-request', firebaseAuthMiddleware, async (req, r
       return res.status(409).json({ error: 'Request already exists' });
     }
     return res.status(500).json({ error: 'Deposit request failed' });
+  }
+});
+
+app.post('/referrals/apply', firebaseAuthMiddleware, async (req, res) => {
+  try {
+    const newUserId = (req.user.uid || '').toString().trim();
+    const referralCode = (req.body.referralCode || '').toString().trim().toUpperCase();
+    const requestedBonus = Number(req.body.referralBonus || 5);
+    const referralBonus = Number.isFinite(requestedBonus)
+      ? Math.max(1, Math.min(500, Math.floor(requestedBonus)))
+      : 5;
+    if (!newUserId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    if (!referralCode) {
+      return res.status(400).json({ error: 'Referral code required' });
+    }
+
+    const newUserRef = db.collection('users').doc(newUserId);
+    const referrerQuery = await db
+      .collection('users')
+      .where('referralCode', '==', referralCode)
+      .limit(1)
+      .get();
+    if (referrerQuery.empty) {
+      return res.status(404).json({ error: 'Referral code not found' });
+    }
+
+    const referrerRef = referrerQuery.docs[0].ref;
+    const referrerUid = referrerRef.id;
+    if (!referrerUid || referrerUid === newUserId) {
+      return res.status(400).json({ error: 'Invalid referral code' });
+    }
+
+    const referralRef = db.collection('referrals').doc(`${referrerUid}-${newUserId}`);
+    let alreadyApplied = false;
+    let repairedReferrerReward = false;
+
+    await db.runTransaction(async (tx) => {
+      const [newUserSnap, referrerSnap, referralSnap] = await Promise.all([
+        tx.get(newUserRef),
+        tx.get(referrerRef),
+        tx.get(referralRef),
+      ]);
+      if (!newUserSnap.exists) {
+        throw new Error('USER_NOT_FOUND');
+      }
+      if (!referrerSnap.exists) {
+        throw new Error('REFERRER_NOT_FOUND');
+      }
+
+      const newUserData = newUserSnap.data() || {};
+      const referrerData = referrerSnap.data() || {};
+      const existingReferrerUid = (newUserData.referredByUid || '').toString().trim();
+      const referrerRole = (referrerData.role || '').toString().trim().toLowerCase();
+      const needsNewUserCredit = !existingReferrerUid;
+
+      if (existingReferrerUid && existingReferrerUid !== referrerUid) {
+        alreadyApplied = true;
+        return;
+      }
+      if (referralSnap.exists) {
+        alreadyApplied = true;
+        return;
+      }
+
+      const newUserPatch = {
+        referredByUid: referrerUid,
+        referredByCode: referralCode,
+        referralStatus: 'applied',
+        referralAppliedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+      if (needsNewUserCredit) {
+        newUserPatch.wallet = {
+          bonus: admin.firestore.FieldValue.increment(referralBonus),
+          total: admin.firestore.FieldValue.increment(referralBonus),
+        };
+      }
+      if (referrerRole === 'creator') {
+        newUserPatch.creatorUid = referrerUid;
+        newUserPatch.creatorCode = referralCode;
+        newUserPatch.creatorAssignedAt = admin.firestore.FieldValue.serverTimestamp();
+      }
+      tx.set(newUserRef, newUserPatch, { merge: true });
+
+      tx.set(
+        referrerRef,
+        {
+          referralCount: admin.firestore.FieldValue.increment(1),
+          referralEarnings: admin.firestore.FieldValue.increment(referralBonus),
+          wallet: {
+            bonus: admin.firestore.FieldValue.increment(referralBonus),
+            total: admin.firestore.FieldValue.increment(referralBonus),
+          },
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+      repairedReferrerReward = !needsNewUserCredit;
+
+      tx.set(
+        referralRef,
+        {
+          referrerUid,
+          referredUid: newUserId,
+          referrerCode: referralCode,
+          referrerRole,
+          status: 'joined',
+          bonus: referralBonus,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      if (needsNewUserCredit) {
+        tx.set(
+          db.collection('wallet_transactions').doc(),
+          {
+            userId: newUserId,
+            type: 'credit',
+            status: 'success',
+            amount: referralBonus,
+            source: 'referral_used',
+            note: 'Referral bonus credited',
+            relatedUserId: referrerUid,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+      }
+
+      tx.set(
+        db.collection('wallet_transactions').doc(),
+        {
+          userId: referrerUid,
+          type: 'credit',
+          status: 'success',
+          amount: referralBonus,
+          source: 'referral',
+          note: repairedReferrerReward
+            ? 'Referral bonus repaired for existing referred user'
+            : 'Referral bonus for inviting a new user',
+          relatedUserId: newUserId,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    });
+
+    return res.json({
+      ok: true,
+      alreadyApplied,
+      repairedReferrerReward,
+      referrerUid,
+      referralBonus,
+    });
+  } catch (err) {
+    console.error(err);
+    if ((err && err.message) === 'USER_NOT_FOUND') {
+      return res.status(404).json({ error: 'User account not found' });
+    }
+    if ((err && err.message) === 'REFERRER_NOT_FOUND') {
+      return res.status(404).json({ error: 'Referrer account not found' });
+    }
+    return res.status(500).json({ error: 'Referral apply failed' });
   }
 });
 
@@ -2252,6 +2627,195 @@ app.post('/prizes/coin/assign', firebaseAuthMiddleware, async (req, res) => {
   }
 });
 
+function normalizeStaffRoleFromUserData(data = {}) {
+  const candidates = [
+    data.role,
+    data.userRole,
+    data.type,
+    data.accountType,
+    data.user_type,
+  ];
+
+  for (const candidate of candidates) {
+    const normalized = (candidate || '').toString().trim().toLowerCase();
+    if (!normalized) continue;
+    if (
+      normalized === 'administrator' ||
+      normalized === 'superadmin' ||
+      normalized === 'super_admin'
+    ) {
+      return 'admin';
+    }
+    if (normalized === 'content_creator') {
+      return 'creator';
+    }
+    if (isStaffRoleValue(normalized)) {
+      return normalized;
+    }
+  }
+
+  if (data.isAdmin === true || data.admin === true) return 'admin';
+  if (data.isOwner === true || data.owner === true) return 'owner';
+  if (data.isStaff === true || data.staff === true) return 'staff';
+  if (data.isCreator === true || data.creator === true) return 'creator';
+  return '';
+}
+
+function isAlertEligibleStaffDoc(doc) {
+  if (!doc || !doc.id) return false;
+  const data = doc.data() || {};
+  const status = (data.status || 'active').toString().trim().toLowerCase();
+  const banned = data.isBanned === true || status === 'banned';
+  if (banned) return false;
+  return normalizeStaffRoleFromUserData(data) !== '';
+}
+
+async function getActiveStaffAlertDocs() {
+  const exactSnap = await db
+    .collection('users')
+    .where('role', 'in', ['admin', 'owner', 'staff', 'creator'])
+    .get();
+  const fallbackSnap = await db.collection('users').limit(300).get();
+  const docs = [...exactSnap.docs, ...fallbackSnap.docs].filter((doc) =>
+    isAlertEligibleStaffDoc(doc)
+  );
+
+  const unique = new Map();
+  for (const doc of docs) {
+    if (!doc.id || unique.has(doc.id)) continue;
+    unique.set(doc.id, doc);
+  }
+  return Array.from(unique.values());
+}
+
+function collectStaffAlertEmails(staffDocs = []) {
+  const emails = new Set();
+  for (const doc of staffDocs) {
+    const data = doc?.data?.() || {};
+    const candidates = [data.email, data.emailLower, data.loginEmail];
+    for (const value of candidates) {
+      const normalized = normalizeEmail(value || '');
+      if (isValidEmail(normalized)) {
+        emails.add(normalized);
+        break;
+      }
+    }
+  }
+  return Array.from(emails);
+}
+
+async function sendStaffAlertEmails({ staffDocs = [], subject, text, html }) {
+  const emails = collectStaffAlertEmails(staffDocs);
+  if (!mailer || emails.length === 0) {
+    return { targeted: emails.length, sent: 0 };
+  }
+
+  const results = await Promise.allSettled(
+    emails.map((to) =>
+      sendEmail({
+        to,
+        subject,
+        text,
+        html,
+      })
+    )
+  );
+
+  return {
+    targeted: emails.length,
+    sent: results.filter((item) => item.status === 'fulfilled').length,
+  };
+}
+
+async function sendWithdrawRequestAlertEmails({
+  requestId,
+  userId,
+  userName,
+  userEmail,
+  userPhone,
+  amount,
+  method,
+  upiId,
+  accountHolderName,
+  bankAccountNumber,
+  ifsc,
+  bankName,
+  branch,
+  staffDocs = [],
+}) {
+  const recipients =
+    Array.isArray(staffDocs) && staffDocs.length > 0
+      ? staffDocs
+      : await getActiveStaffAlertDocs();
+  if (recipients.length === 0) {
+    return { targeted: 0, sent: 0 };
+  }
+
+  const displayName = (userName || '').trim() || userId;
+  const methodLabel = (method || 'upi').toString().trim().toUpperCase();
+  const lines = [
+    'New withdraw request received.',
+    `Request ID: ${requestId}`,
+    `User: ${displayName}`,
+    userEmail ? `Email: ${userEmail}` : '',
+    userPhone ? `Phone: ${userPhone}` : '',
+    `Amount: Rs ${Number(amount || 0).toFixed(2)}`,
+    `Method: ${methodLabel}`,
+    upiId ? `UPI ID: ${upiId}` : '',
+    accountHolderName ? `Account Holder: ${accountHolderName}` : '',
+    bankAccountNumber ? `Bank Account: ${bankAccountNumber}` : '',
+    ifsc ? `IFSC: ${ifsc}` : '',
+    bankName ? `Bank Name: ${bankName}` : '',
+    branch ? `Branch: ${branch}` : '',
+  ].filter(Boolean);
+
+  const safeLines = lines.map((line) => `<div>${escapeHtml(line)}</div>`).join('');
+  return sendStaffAlertEmails({
+    staffDocs: recipients,
+    subject: 'New Withdraw Request',
+    text: lines.join('\n'),
+    html: `<div>${safeLines}</div>`,
+  });
+}
+
+async function sendManualDepositRequestAlertEmails({
+  requestId,
+  userId,
+  userName,
+  userEmail,
+  userPhone,
+  amount,
+  utr,
+  staffDocs = [],
+}) {
+  const recipients =
+    Array.isArray(staffDocs) && staffDocs.length > 0
+      ? staffDocs
+      : await getActiveStaffAlertDocs();
+  if (recipients.length === 0) {
+    return { targeted: 0, sent: 0 };
+  }
+
+  const displayName = (userName || '').trim() || userId;
+  const lines = [
+    'New deposit request received.',
+    `Request ID: ${requestId}`,
+    `User: ${displayName}`,
+    userEmail ? `Email: ${userEmail}` : '',
+    userPhone ? `Phone: ${userPhone}` : '',
+    `Amount: Rs ${Number(amount || 0).toFixed(2)}`,
+    `UTR: ${utr}`,
+  ].filter(Boolean);
+
+  const safeLines = lines.map((line) => `<div>${escapeHtml(line)}</div>`).join('');
+  return sendStaffAlertEmails({
+    staffDocs: recipients,
+    subject: 'New Deposit Request',
+    text: lines.join('\n'),
+    html: `<div>${safeLines}</div>`,
+  });
+}
+
 async function queueWithdrawRequestAlerts({
   requestId,
   userId,
@@ -2266,12 +2830,13 @@ async function queueWithdrawRequestAlerts({
   ifsc,
   bankName,
   branch,
+  staffDocs = [],
 }) {
-  const staffSnap = await db
-    .collection('users')
-    .where('role', 'in', ['admin', 'owner', 'staff', 'creator'])
-    .get();
-  if (staffSnap.empty) return;
+  const recipients =
+    Array.isArray(staffDocs) && staffDocs.length > 0
+      ? staffDocs
+      : await getActiveStaffAlertDocs();
+  if (recipients.length === 0) return 0;
 
   const displayName = (userName || '').trim() || userId;
   const title = 'New Withdraw Request';
@@ -2293,7 +2858,7 @@ async function queueWithdrawRequestAlerts({
     count = 0;
   }
 
-  for (const doc of staffSnap.docs) {
+  for (const doc of recipients) {
     const adminId = doc.id;
     if (!adminId) continue;
 
@@ -2354,6 +2919,7 @@ async function queueWithdrawRequestAlerts({
   }
 
   await commitBatchIfNeeded(true);
+  return recipients.length;
 }
 
 async function queueManualDepositRequestAlerts({
@@ -2364,12 +2930,13 @@ async function queueManualDepositRequestAlerts({
   userPhone,
   amount,
   utr,
+  staffDocs = [],
 }) {
-  const staffSnap = await db
-    .collection('users')
-    .where('role', 'in', ['admin', 'owner', 'staff', 'creator'])
-    .get();
-  if (staffSnap.empty) return;
+  const recipients =
+    Array.isArray(staffDocs) && staffDocs.length > 0
+      ? staffDocs
+      : await getActiveStaffAlertDocs();
+  if (recipients.length === 0) return 0;
 
   const displayName = (userName || '').trim() || userId;
   const title = 'New Deposit Request';
@@ -2388,7 +2955,7 @@ async function queueManualDepositRequestAlerts({
     count = 0;
   }
 
-  for (const doc of staffSnap.docs) {
+  for (const doc of recipients) {
     const adminId = doc.id;
     if (!adminId) continue;
 
@@ -2437,6 +3004,7 @@ async function queueManualDepositRequestAlerts({
   }
 
   await commitBatchIfNeeded(true);
+  return recipients.length;
 }
 
 async function finalizeOrderPayment({
@@ -2729,6 +3297,8 @@ let pushWorkerTimer = null;
 let dailyCampaignBusy = false;
 let dailyCampaignTimer = null;
 let lastDailyCampaignDateKey = '';
+let upcomingMatchReminderBusy = false;
+let upcomingMatchReminderTimer = null;
 
 async function runPushWorkerTick() {
   if (pushWorkerBusy) return;
@@ -2793,14 +3363,43 @@ function startDailyCampaignScheduler() {
   });
 }
 
+async function runUpcomingMatchReminderTick() {
+  if (upcomingMatchReminderBusy) return;
+  upcomingMatchReminderBusy = true;
+  try {
+    const queued = await queueUpcomingMatchReminderNotifications({ leadMinutes: 10 });
+    const push = await flushPushQueueNow({ maxTicks: 10, batchSize: PUSH_WORKER_BATCH_SIZE });
+    if (queued.queuedNotifications > 0 || push.picked > 0) {
+      console.log(
+        `[match-reminder] matches=${queued.queuedMatches}, queued=${queued.queuedNotifications}, pushSent=${push.sent}, pushFailed=${push.failed}`
+      );
+    }
+  } catch (err) {
+    console.error('[match-reminder] tick failed', err);
+  } finally {
+    upcomingMatchReminderBusy = false;
+  }
+}
+
+function startUpcomingMatchReminderScheduler() {
+  if (upcomingMatchReminderTimer) return;
+  upcomingMatchReminderTimer = setInterval(() => {
+    runUpcomingMatchReminderTick().catch((err) => {
+      console.error('[match-reminder] uncaught tick error', err);
+    });
+  }, 60 * 1000);
+  runUpcomingMatchReminderTick().catch((err) => {
+    console.error('[match-reminder] startup tick error', err);
+  });
+}
+
 if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`Razorpay backend running on port ${PORT}`);
     startPushWorker();
     startDailyCampaignScheduler();
+    startUpcomingMatchReminderScheduler();
   });
 }
 
 module.exports = app;
-
-
